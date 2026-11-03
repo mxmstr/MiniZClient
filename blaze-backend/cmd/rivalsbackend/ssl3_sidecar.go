@@ -126,9 +126,9 @@ func findOpenSSL() (string, string, error) {
 		rejected = append(rejected, fmt.Sprintf("%s (%v)", path, err))
 	}
 	if len(rejected) != 0 {
-		return "", "", fmt.Errorf("no usable SSL3 runtime: %s", strings.Join(rejected, "; "))
+		return "", "", fmt.Errorf("no usable legacy TLS runtime: %s", strings.Join(rejected, "; "))
 	}
-	return "", "", errors.New("bundled patched SSL3 runtime was not found; expected openssl-ssl3\\openssl-ds3-pipe.exe beside ds3-backend.exe (or set ZCLIENT_SSL3_OPENSSL)")
+	return "", "", errors.New("bundled patched legacy TLS runtime was not found; expected openssl-ssl3\\openssl-ds3-pipe.exe beside the backend executable (or set ZCLIENT_SSL3_OPENSSL)")
 }
 
 func writeSidecarCertificate(directory string, certificate tls.Certificate) (string, string, string, error) {
@@ -288,6 +288,114 @@ func serveSSL3Redirector(ctx context.Context, address string,
 		}
 		if waitErr := command.Wait(); waitErr != nil && ctx.Err() == nil {
 			log.Printf("DS3 SSL3 sidecar exited: %v", waitErr)
+		}
+	}
+	return nil
+}
+
+// serveRivalsTLS11Redirector uses the legacy OpenSSL implementation for the
+// TLS 1.1 wire protocol expected by NFS14's DirtySSL client. Go's TLS server
+// negotiates the same version and cipher, but its modern ServerHello flight is
+// rejected by the client before it reaches the Windows certificate APIs. The
+// decrypted Blaze request and reply remain owned by this backend.
+func serveRivalsTLS11Redirector(ctx context.Context, address string,
+	certificate tls.Certificate, advertiseHost string, blazePort uint16,
+	capturePath string) error {
+	openssl, opensslVersion, err := findOpenSSL()
+	if err != nil {
+		return err
+	}
+	_, listenPort, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid Rivals TLS 1.1 redirector address %q: %w", address, err)
+	}
+	log.Printf("Rivals TLS 1.1 sidecar runtime verified: %s (%s)", opensslVersion, openssl)
+	directory, err := os.MkdirTemp("", "zclient-rivals-tls11-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(directory)
+	certPath, keyPath, chainPath, err := writeSidecarCertificate(directory, certificate)
+	if err != nil {
+		return err
+	}
+	captureFile, err := os.OpenFile(capturePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer captureFile.Close()
+	capture := &probeCapture{encoder: json.NewEncoder(captureFile)}
+
+	for ctx.Err() == nil {
+		arguments := []string{"s_server", "-accept", listenPort,
+			"-cert", certPath, "-key", keyPath}
+		if chainPath != "" {
+			arguments = append(arguments, "-cert_chain", chainPath)
+		}
+		arguments = append(arguments,
+			"-quiet", "-state", "-naccept", "1", "-tls1_1",
+			"-cipher", "AES256-SHA", "-bugs")
+		command := exec.CommandContext(ctx, openssl, arguments...)
+		command.Env = append(os.Environ(), "OPENSSL_CONF="+os.DevNull)
+		stdin, err := command.StdinPipe()
+		if err != nil {
+			return err
+		}
+		stdout, err := command.StdoutPipe()
+		if err != nil {
+			return err
+		}
+		stderr, err := command.StderrPipe()
+		if err != nil {
+			return err
+		}
+		if err := command.Start(); err != nil {
+			return fmt.Errorf("start Rivals TLS 1.1 sidecar: %w", err)
+		}
+		writeEvents := make(chan int, 4)
+		go relaySidecarDiagnostics(stderr, writeEvents)
+		log.Printf("Rivals legacy TLS 1.1 redirector listening on 0.0.0.0:%s for %s",
+			listenPort, address)
+
+		request, readErr := readBlazeFrame(stdout)
+		replySent := false
+		if readErr == nil {
+			component, requestCommand, messageType, correlation := blazeMetadata(request)
+			log.Printf("Rivals TLS 1.1 redirector request component=%d command=%d type=%d correlation=%d bytes=%d",
+				component, requestCommand, messageType, correlation, len(request))
+			log.Printf("Rivals TLS 1.1 redirector request frame=%s", hex.EncodeToString(request))
+			capture.write("tls11-redirector:request", request)
+			if component == 5 && requestCommand == 1 && messageType == 0 {
+				reply, replyErr := makeRedirectorReply(correlation, advertiseHost, blazePort)
+				if replyErr == nil {
+					_, replyErr = stdin.Write(reply)
+				}
+				if replyErr == nil {
+					replyErr = waitSidecarWrite(ctx, writeEvents, len(reply))
+				}
+				if replyErr != nil {
+					log.Printf("Rivals TLS 1.1 redirector reply failed: %v", replyErr)
+				} else {
+					log.Printf("Rivals TLS 1.1 redirector reply frame=%s", hex.EncodeToString(reply))
+					capture.write("tls11-redirector:reply", reply)
+					log.Printf("Rivals TLS 1.1 redirector advertised %s:%d correlation=%d",
+						advertiseHost, blazePort, correlation)
+					replySent = true
+				}
+			}
+		} else if ctx.Err() == nil && !errors.Is(readErr, io.EOF) {
+			log.Printf("Rivals TLS 1.1 redirector read failed: %v", readErr)
+		}
+		closeErr := stdin.Close()
+		if replySent {
+			if closeErr != nil {
+				log.Printf("Rivals TLS 1.1 response-pipe close failed: %v", closeErr)
+			} else {
+				log.Printf("Rivals TLS 1.1 redirector response flushed; closing one-shot session")
+			}
+		}
+		if waitErr := command.Wait(); waitErr != nil && ctx.Err() == nil {
+			log.Printf("Rivals TLS 1.1 sidecar exited: %v", waitErr)
 		}
 	}
 	return nil

@@ -368,7 +368,9 @@ void patch_cmain_lsx_redirect_impl(HANDLE process, const std::string& service_ho
               << " to " << service_host << '\n';
 }
 
-void patch_game_blaze_redirector_impl(HANDLE process, const std::string& service_host) 
+void patch_game_blaze_redirector_impl(HANDLE process,
+                                      const std::string& service_host,
+                                      bool required = true)
 {
     // The original ZClient hosts EA.dll, which intercepts Blaze's production
     // redirector and returns its local server address. The minimal launcher
@@ -437,7 +439,11 @@ void patch_game_blaze_redirector_impl(HANDLE process, const std::string& service
                                   return left.address == right.address;
                               }), matches.end());
     if (matches.empty()) {
-        fail("Could not locate a Blaze redirector hostname in the game.");
+        if (required) {
+            fail("Could not locate a Blaze redirector hostname in the game.");
+        }
+        std::cout << "No embedded Blaze redirector hostname found; continuing without a redirect patch\n";
+        return;
     }
     for (const auto& match : matches) {
         std::vector<char> replacement(match.length, '\0');
@@ -764,6 +770,50 @@ struct ZloContext64 {
 static_assert(sizeof(ZloContext64) == 37);
 
 } // namespace
+
+void preload_standalone_lsx_shim(
+    HANDLE process, HANDLE primary_thread, DWORD process_id,
+    const std::filesystem::path& shim_path,
+    const std::string& service_host,
+    bool preserve_suspended) {
+    const EntryGate entry_gate = start_at_loader_initialized_gate(
+        process, primary_thread, process_id);
+    const std::wstring suffix = std::to_wstring(process_id);
+    const std::wstring ready_name =
+        L"Local\\ZClient_LsxShimReady_" + suffix;
+    const std::wstring network_ready_name =
+        L"Local\\ZClient_LsxShimNetworkReady_" + suffix;
+    Handle ready(CreateEventW(nullptr, TRUE, FALSE, ready_name.c_str()));
+    Handle network_ready(CreateEventW(
+        nullptr, TRUE, FALSE, network_ready_name.c_str()));
+    if (!ready || !network_ready) {
+        fail("CreateEventW(standalone LSX shim readiness) failed");
+    }
+
+    remote_load_dependency(
+        process, primary_thread, process_id,
+        std::filesystem::absolute(shim_path).wstring());
+    const DWORD ready_wait = WaitForSingleObject(ready.get(), 10000);
+    if (ready_wait != WAIT_OBJECT_0) {
+        fail(ready_wait == WAIT_TIMEOUT
+            ? "Timed out waiting for the standalone LSX shim"
+            : "Waiting for the standalone LSX shim failed");
+    }
+    const DWORD network_wait = WaitForSingleObject(network_ready.get(), 10000);
+    if (network_wait != WAIT_OBJECT_0) {
+        fail(network_wait == WAIT_TIMEOUT
+            ? "Timed out enabling standalone LSX shim network hooks"
+            : "Waiting for standalone LSX shim network hooks failed");
+    }
+
+    patch_game_blaze_redirector_impl(process, service_host, false);
+    if (preserve_suspended &&
+        SuspendThread(primary_thread) == static_cast<DWORD>(-1)) {
+        fail("SuspendThread(preserve child suspension) failed");
+    }
+    release_entry_gate(process, entry_gate);
+    std::cout << "Loaded standalone LSX shim and released the x64 entry gate\n";
+}
 
 std::vector<std::uint8_t> prepare_zclient_loader_image(
     const std::filesystem::path& image_path, const std::string& service_host,

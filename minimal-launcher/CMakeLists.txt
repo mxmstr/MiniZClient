@@ -19,10 +19,25 @@ if(ZCLIENT_INJECTOR32_ONLY)
     UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
     _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH)
   target_link_libraries(zclient_injector32 PRIVATE ws2_32)
+
+  add_library(zclient_lsx_shim32 SHARED
+    src/common.cpp
+    src/lsx_shim.cpp
+    src/lsx_server.cpp)
+  set_target_properties(zclient_lsx_shim32 PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "ZClient.LsxShim32")
+  target_compile_features(zclient_lsx_shim32 PRIVATE cxx_std_20)
+  target_compile_definitions(zclient_lsx_shim32 PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
+    _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH)
+  target_link_libraries(zclient_lsx_shim32 PRIVATE ws2_32 bcrypt)
   if(MSVC)
     target_compile_options(zclient_injector32 PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(zclient_lsx_shim32 PRIVATE /W4 /permissive- /EHsc)
   else()
     target_compile_options(zclient_injector32 PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(zclient_lsx_shim32 PRIVATE -Wall -Wextra -Wpedantic)
   endif()
   return()
 endif()
@@ -36,6 +51,7 @@ add_executable(zclient_minimal_launcher
   src/main.cpp
   src/manual_map.cpp
   src/pe_architecture.cpp
+  src/runtime_profile.cpp
   src/zbackend_client.cpp)
 add_library(zclient_lsx_shim SHARED
   src/common.cpp
@@ -47,6 +63,10 @@ set_target_properties(zclient_lsx_shim PROPERTIES
 add_dependencies(zclient_minimal_launcher zclient_lsx_shim)
 add_executable(lsx_shim_test src/lsx_shim_test.cpp)
 add_dependencies(lsx_shim_test zclient_lsx_shim)
+add_executable(lsx_shim_standalone_test src/lsx_shim_test.cpp)
+add_dependencies(lsx_shim_standalone_test zclient_lsx_shim)
+target_compile_definitions(lsx_shim_standalone_test PRIVATE
+  ZCLIENT_TEST_STANDALONE_SHIM=1)
 add_executable(bf3_launch_test
   src/bf3_launch.cpp
   src/bf3_launch_test.cpp)
@@ -56,13 +76,18 @@ add_executable(pe_architecture_test
 add_executable(license_server_test
   src/license_server.cpp
   src/license_server_test.cpp)
+add_executable(runtime_profile_test
+  src/runtime_profile.cpp
+  src/runtime_profile_test.cpp)
 target_compile_features(zclient_minimal_launcher PRIVATE cxx_std_20)
 target_compile_features(zclient_lsx_shim PRIVATE cxx_std_20)
 target_compile_features(lsx_shim_test PRIVATE cxx_std_20)
+target_compile_features(lsx_shim_standalone_test PRIVATE cxx_std_20)
 target_compile_features(bf3_launch_test PRIVATE cxx_std_20)
 target_compile_features(pe_architecture_test PRIVATE cxx_std_20)
 target_compile_features(license_server_test PRIVATE cxx_std_20)
-foreach(target zclient_minimal_launcher zclient_lsx_shim lsx_shim_test bf3_launch_test pe_architecture_test license_server_test)
+target_compile_features(runtime_profile_test PRIVATE cxx_std_20)
+foreach(target zclient_minimal_launcher zclient_lsx_shim lsx_shim_test lsx_shim_standalone_test bf3_launch_test pe_architecture_test license_server_test runtime_profile_test)
   target_compile_definitions(${target} PRIVATE
     UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
     _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH)
@@ -70,19 +95,24 @@ endforeach()
 target_link_libraries(zclient_minimal_launcher PRIVATE ws2_32 bcrypt)
 target_link_libraries(zclient_lsx_shim PRIVATE ws2_32 bcrypt)
 target_link_libraries(lsx_shim_test PRIVATE ws2_32 iphlpapi)
+target_link_libraries(lsx_shim_standalone_test PRIVATE ws2_32 iphlpapi)
 target_link_libraries(license_server_test PRIVATE ws2_32)
+target_link_libraries(runtime_profile_test PRIVATE bcrypt)
 
 if(MSVC)
   target_compile_options(zclient_minimal_launcher PRIVATE /W4 /permissive- /EHsc)
   target_compile_options(zclient_lsx_shim PRIVATE /W4 /permissive- /EHsc)
   target_compile_options(lsx_shim_test PRIVATE /W4 /permissive- /EHsc)
+  target_compile_options(lsx_shim_standalone_test PRIVATE /W4 /permissive- /EHsc)
   target_compile_options(bf3_launch_test PRIVATE /W4 /permissive- /EHsc)
   target_compile_options(pe_architecture_test PRIVATE /W4 /permissive- /EHsc)
   target_compile_options(license_server_test PRIVATE /W4 /permissive- /EHsc)
+  target_compile_options(runtime_profile_test PRIVATE /W4 /permissive- /EHsc)
 else()
   target_compile_options(zclient_minimal_launcher PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(zclient_lsx_shim PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(lsx_shim_test PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(lsx_shim_standalone_test PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(bf3_launch_test PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(pe_architecture_test PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(license_server_test PRIVATE -Wall -Wextra -Wpedantic)
@@ -105,11 +135,12 @@ ExternalProject_Add(zclient_injector32_build
     -DCMAKE_CONFIGURATION_TYPES=Release
   BUILD_COMMAND
     "${CMAKE_COMMAND}" --build <BINARY_DIR> --config Release
-    --target zclient_injector32
+    --target zclient_injector32 zclient_lsx_shim32
   INSTALL_COMMAND ""
   BUILD_ALWAYS TRUE
   BUILD_BYPRODUCTS
-    "${ZCLIENT_INJECTOR32_BUILD_DIR}/Release/zclient_injector32.exe")
+    "${ZCLIENT_INJECTOR32_BUILD_DIR}/Release/zclient_injector32.exe"
+    "${ZCLIENT_INJECTOR32_BUILD_DIR}/Release/ZClient.LsxShim32.dll")
 add_custom_target(zclient_injector32_publish ALL
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
     "${ZCLIENT_INJECTOR32_BUILD_DIR}/Release/zclient_injector32.exe"
@@ -118,7 +149,17 @@ add_custom_target(zclient_injector32_publish ALL
   VERBATIM)
 add_dependencies(zclient_minimal_launcher zclient_injector32_publish)
 
+add_custom_target(zclient_lsx_shim32_publish ALL
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+    "${ZCLIENT_INJECTOR32_BUILD_DIR}/Release/ZClient.LsxShim32.dll"
+    "$<TARGET_FILE_DIR:zclient_minimal_launcher>/ZClient.LsxShim32.dll"
+  DEPENDS zclient_injector32_build
+  VERBATIM)
+add_dependencies(zclient_minimal_launcher zclient_lsx_shim32_publish)
+
 add_test(NAME lsx_shim_redirect COMMAND lsx_shim_test)
+add_test(NAME lsx_shim_standalone COMMAND lsx_shim_standalone_test)
 add_test(NAME bf3_launch_arguments COMMAND bf3_launch_test)
 add_test(NAME pe_architecture COMMAND pe_architecture_test)
 add_test(NAME license_server_replay COMMAND license_server_test)
+add_test(NAME runtime_profile COMMAND runtime_profile_test)

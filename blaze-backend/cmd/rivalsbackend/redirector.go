@@ -11,6 +11,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func redirectorTLSConfig(base *tls.Config) *tls.Config {
@@ -72,9 +73,22 @@ func (l redirectorTLSListener) Accept() (net.Conn, error) {
 				raw.RemoteAddr(), uint16(hello[1])<<8|uint16(hello[2]),
 				uint16(hello[9])<<8|uint16(hello[10]))
 		}
+		// Handshake inside Accept so malformed legacy clients never reach the
+		// Blaze frame reader, but bound it so one client cannot monopolize the
+		// redirector listener indefinitely.
+		if err := raw.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			log.Printf("Blaze redirector deadline failed remote=%s error=%v", raw.RemoteAddr(), err)
+			_ = raw.Close()
+			continue
+		}
 		connection := tls.Server(&bufferedConn{Conn: raw, reader: reader}, l.config)
 		if err := connection.Handshake(); err != nil {
 			log.Printf("Blaze redirector TLS failed remote=%s stage=handshake error=%v", raw.RemoteAddr(), err)
+			_ = raw.Close()
+			continue
+		}
+		if err := raw.SetDeadline(time.Time{}); err != nil {
+			log.Printf("Blaze redirector deadline clear failed remote=%s error=%v", raw.RemoteAddr(), err)
 			_ = raw.Close()
 			continue
 		}

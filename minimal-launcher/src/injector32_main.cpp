@@ -31,6 +31,8 @@ namespace fs = std::filesystem;
 
 struct Arguments {
     bool monitor_activation = false;
+    bool standalone_shim = false;
+    bool preserve_suspended = false;
     DWORD process_id = 0;
     DWORD thread_id = 0;
     fs::path bootstrap;
@@ -57,10 +59,26 @@ Arguments parse_arguments(int argc, wchar_t** argv) {
         result.ready_event_name = argv[3];
         return result;
     }
+    if ((argc == 6 || argc == 7) && std::wstring_view(argv[1]) == L"--inject-shim") {
+        Arguments result;
+        result.standalone_shim = true;
+        result.process_id = parse_u32(argv[2], "pid");
+        result.thread_id = parse_u32(argv[3], "tid");
+        result.bootstrap = fs::absolute(argv[4]);
+        result.service_host = encode_utf8(argv[5]);
+        if (argc == 7) {
+            if (std::wstring_view(argv[6]) != L"--preserve-suspended")
+                throw std::runtime_error("unknown --inject-shim option");
+            result.preserve_suspended = true;
+        }
+        return result;
+    }
     if (argc != 7) {
         throw std::runtime_error(
             "Usage: zclient_injector32 <pid> <tid> <CLoaderx32.dll> "
             "<service IPv4> <LSX IPv4> <seven-character namespace>\n"
+            "   or: zclient_injector32 --inject-shim <pid> <tid> "
+            "<ZClient.LsxShim32.dll> <service IPv4>\n"
             "   or: zclient_injector32 --monitor-activation <pid> <ready-event>");
     }
 
@@ -573,6 +591,47 @@ void patch_game_blaze_redirector(HANDLE process,
     }
     std::cout << "Patched " << matches.size()
               << " x86 Blaze redirector hostname(s) to " << service_host << '\n';
+}
+
+void inject_standalone_shim(HANDLE process, HANDLE primary_thread,
+                            DWORD process_id, const fs::path& shim,
+                            const std::string& service_host,
+                            bool preserve_suspended) {
+    const EntryGate gate = start_entry_gate(
+        process, primary_thread, process_id);
+    const std::wstring suffix = std::to_wstring(process_id);
+    const std::wstring ready_name =
+        L"Local\\ZClient_LsxShimReady_" + suffix;
+    const std::wstring network_ready_name =
+        L"Local\\ZClient_LsxShimNetworkReady_" + suffix;
+    Handle ready(CreateEventW(nullptr, TRUE, FALSE, ready_name.c_str()));
+    Handle network_ready(CreateEventW(
+        nullptr, TRUE, FALSE, network_ready_name.c_str()));
+    if (!ready || !network_ready) {
+        fail("CreateEventW(x86 standalone shim readiness) failed");
+    }
+
+    remote_load_dependency(
+        process, primary_thread, process_id,
+        fs::absolute(shim).wstring());
+    const DWORD ready_wait = WaitForSingleObject(ready.get(), 10000);
+    if (ready_wait != WAIT_OBJECT_0) {
+        throw std::runtime_error(ready_wait == WAIT_TIMEOUT
+            ? "Timed out waiting for the x86 standalone LSX shim"
+            : "Waiting for the x86 standalone LSX shim failed");
+    }
+    const DWORD network_wait = WaitForSingleObject(network_ready.get(), 10000);
+    if (network_wait != WAIT_OBJECT_0) {
+        throw std::runtime_error(network_wait == WAIT_TIMEOUT
+            ? "Timed out enabling x86 standalone LSX shim networking"
+            : "Waiting for x86 standalone LSX shim networking failed");
+    }
+    patch_game_blaze_redirector(process, service_host);
+    if (preserve_suspended &&
+        SuspendThread(primary_thread) == static_cast<DWORD>(-1)) {
+        fail("SuspendThread(preserve x86 child suspension) failed");
+    }
+    release_entry_gate(process, gate);
 }
 
 template <std::size_t Size>
@@ -1590,6 +1649,15 @@ int wmain(int argc, wchar_t** argv) {
         if (!target_wow64) {
             throw std::runtime_error(
                 "zclient_injector32 was given a process that is not running under WOW64.");
+        }
+
+        if (arguments.standalone_shim) {
+            inject_standalone_shim(
+                process.get(), thread.get(), arguments.process_id,
+                arguments.bootstrap, arguments.service_host,
+                arguments.preserve_suspended);
+            std::cout << "Loaded standalone LSX shim and released the x86 entry gate\n";
+            return 0;
         }
 
         std::unique_ptr<ActivationPatchMonitor> activation_monitor = map_loader32(

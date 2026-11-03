@@ -650,10 +650,31 @@ func TestNFS13NetworkInfoRefreshAlwaysPublishesSessionData(t *testing.T) {
 			t.Fatalf("network-info attempt %d notification: %v", attempt+1, readErr)
 		}
 		component, command, messageType, correlation = blazeMetadata(notification)
-		if len(notification) != 125 || component != 0x7802 || command != 1 ||
+		if component != 0x7802 || command != 1 ||
 			messageType != 2 || correlation != 0 {
 			t.Fatalf("network-info notification %d = len %d %04x/%d type %d correlation %d",
 				attempt+1, len(notification), component, command, messageType, correlation)
+		}
+		packet, err := decodePacket(notification)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := structField(packet.Fields, "DATA")
+		if err != nil {
+			t.Fatal(err)
+		}
+		values, err := mapField(data, "DMAP")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ready := false
+		for _, pair := range values.Pairs {
+			if pair.Key == int64(0x70005) && pair.Value == int64(0) {
+				ready = true
+			}
+		}
+		if !ready {
+			t.Fatal("network refresh omitted doublesp readiness data")
 		}
 	}
 }
@@ -986,6 +1007,7 @@ func TestNFS13ResetDedicatedServerCreatesPrivateGameSetup(t *testing.T) {
 	if len(replies) != 2 {
 		t.Fatalf("reset-dedicated-server returned %d frames, want 2", len(replies))
 	}
+	assertNFS13ResetResponseMatchesLiveSetup(t, request)
 	component, command, messageType, correlation := blazeMetadata(replies[0])
 	if component != 4 || command != 25 || messageType != 1 || correlation != 32 {
 		t.Fatalf("reset reply = %d/%d type %d correlation %d, want 4/25 type 1 correlation 32",
@@ -1847,6 +1869,58 @@ func TestLocalIdentityPersonalizesAuthentication(t *testing.T) {
 	}
 }
 
+func TestConfiguredLocalIdentityUsesEAIDAndAccountID(t *testing.T) {
+	server, err := newBlazeServer("192.168.4.199")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestPacket, err := decodePacket(server.corpus[2].request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := fieldAt(requestPacket.Fields, "AUTH", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth.Value = []byte(localZLOAuthTokenPrefix + "506c6179657232:200")
+	request, err := requestPacket.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := localBlazeIdentity(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.name != "Player2" || identity.id != 200 ||
+		identity.gamePort != gamePortForIdentity(
+			localIdentityTransportID([]byte("Player2"))) {
+		t.Fatalf("identity = %#v", identity)
+	}
+}
+
+func TestConfiguredLocalIdentityRejectsInvalidAccountID(t *testing.T) {
+	server, err := newBlazeServer("192.168.4.199")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestPacket, err := decodePacket(server.corpus[2].request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := fieldAt(requestPacket.Fields, "AUTH", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth.Value = []byte(localZLOAuthTokenPrefix + "506c6179657232:0")
+	request, err := requestPacket.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = localBlazeIdentity(request); err == nil {
+		t.Fatal("localBlazeIdentity accepted a zero configured account ID")
+	}
+}
+
 func TestNFS13StatsRepliesUseRequestedGroupAndParseableKey(t *testing.T) {
 	for _, test := range []struct {
 		name, group, groupTag string
@@ -1977,7 +2051,8 @@ func TestNFS13LegacyTokenUsesConfiguredLSXIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	if identity.name != "player" || identity.id != 100 ||
-		identity.gamePort != gamePortForIdentity(100) ||
+		identity.gamePort != gamePortForIdentity(
+			localIdentityTransportID([]byte("player"))) ||
 		string(identity.token) != legacyZLOAuthToken {
 		t.Fatalf("identity = %#v", identity)
 	}

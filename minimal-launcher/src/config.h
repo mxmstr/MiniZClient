@@ -17,6 +17,7 @@ struct Options
     fs::path bootstrap_x86;
     fs::path injector_x86;
     fs::path lsx_shim;
+    fs::path lsx_shim_x86;
     fs::path trace_game_dll;
     fs::path license_response;
     std::string license_signature;
@@ -33,6 +34,8 @@ struct Options
     std::uint32_t game_module_id = 0;
     std::string activation_executable;
     std::uint32_t activation_module_id = 0;
+    std::string compatibility_profile;
+    std::string activation_module_sha256;
     std::uint64_t account_id = 0;
     // ZClient's games-manager constructor stores this value at +0xB0 and
     // its opcode-2 handler returns it verbatim (in network byte order).
@@ -44,6 +47,7 @@ struct Options
     bool local_game_network = false;
     bool lsx_log = true;
     bool breakaway = false;
+    bool no_zlo_runtime = false;
 };
 
 Options parse_options(int argc, wchar_t** argv);

@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <iterator>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -27,6 +28,7 @@
 #include "license_server.h"
 #include "manual_map.h"
 #include "pe_architecture.h"
+#include "runtime_profile.h"
 #include "zbackend_client.h"
 
 namespace fs = std::filesystem;
@@ -60,6 +62,10 @@ std::vector<wchar_t> build_environment(std::wstring_view content_id,
                                        std::uint64_t lsx_account_id,
                                        bool local_game_network,
                                        bool lsx_log,
+                                       bool standalone_lsx,
+                                       std::string_view service_host,
+                                       std::wstring_view launcher_executable,
+                                       std::uint32_t client_token,
                                        std::uint32_t* rtp_launch_code) 
 {
     LPWCH raw = GetEnvironmentStringsW();
@@ -83,6 +89,10 @@ std::vector<wchar_t> build_environment(std::wstring_view content_id,
         L"ZCLIENT_GAME_TITLE",
         L"ZCLIENT_LOCAL_GAME_NETWORK",
         L"ZCLIENT_LSX_LOG",
+        L"ZCLIENT_LSX_STANDALONE",
+        L"ZCLIENT_SERVICE_HOST",
+        L"ZCLIENT_LAUNCHER_EXECUTABLE",
+        L"ZCLIENT_CLIENT_TOKEN",
     };
 
     std::vector<std::wstring> entries;
@@ -116,12 +126,22 @@ std::vector<wchar_t> build_environment(std::wstring_view content_id,
     entries.emplace_back(L"EALaunchOfflineMode=false");
     entries.emplace_back(L"EAGameLocale=");
     entries.emplace_back(L"EALaunchEnv=production");
-    entries.emplace_back(L"ZLSX=1");
+    // ZLSX selects CMain's legacy ZLO LSX/update path. In standalone mode
+    // CMain is intentionally absent; publishing the marker makes Rivals load
+    // ZUpdater instead of starting its native OriginSDK transport.
+    if (!standalone_lsx) entries.emplace_back(L"ZLSX=1");
     entries.emplace_back(L"ZCLIENT_LSX_ACCOUNT_ID=" +
                          std::to_wstring(lsx_account_id));
     entries.emplace_back(L"ZCLIENT_GAME_TITLE=" + std::wstring(game_title));
     if (local_game_network) entries.emplace_back(L"ZCLIENT_LOCAL_GAME_NETWORK=1");
     entries.emplace_back(lsx_log ? L"ZCLIENT_LSX_LOG=1" : L"ZCLIENT_LSX_LOG=0");
+    if (standalone_lsx) entries.emplace_back(L"ZCLIENT_LSX_STANDALONE=1");
+    entries.emplace_back(L"ZCLIENT_SERVICE_HOST=" +
+                         std::wstring(service_host.begin(), service_host.end()));
+    entries.emplace_back(L"ZCLIENT_LAUNCHER_EXECUTABLE=" +
+                         std::wstring(launcher_executable));
+    entries.emplace_back(L"ZCLIENT_CLIENT_TOKEN=" +
+                         std::to_wstring(client_token));
 
     // CreateProcess requires a case-insensitively sorted Unicode environment block.
     std::sort(entries.begin(), entries.end(), [](const std::wstring& left, const std::wstring& right) {
@@ -182,6 +202,49 @@ std::string make_instance_lsx_host(DWORD process_id)
     return "127." + std::to_string((value >> 16) & 0xffu) + "." +
            std::to_string((value >> 8) & 0xffu) + "." +
            std::to_string(value & 0xffu);
+}
+
+fs::path debug_image_path(HANDLE file) {
+    if (!file || file == INVALID_HANDLE_VALUE) return {};
+    std::wstring path(32768, L'\0');
+    const DWORD length = GetFinalPathNameByHandleW(
+        file, path.data(), static_cast<DWORD>(path.size()), FILE_NAME_NORMALIZED);
+    if (!length || length >= path.size()) return {};
+    path.resize(length);
+    constexpr std::wstring_view prefix = L"\\\\?\\";
+    if (path.starts_with(prefix)) path.erase(0, prefix.size());
+    return path;
+}
+
+std::string describe_exception_site(DWORD process_id, const void* address) {
+    const auto target = reinterpret_cast<std::uintptr_t>(address);
+    Handle snapshot(CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id));
+    if (!snapshot || snapshot.get() == INVALID_HANDLE_VALUE) return {};
+    MODULEENTRY32W module{};
+    module.dwSize = sizeof(module);
+    if (!Module32FirstW(snapshot.get(), &module)) return {};
+    do {
+        const auto base = reinterpret_cast<std::uintptr_t>(module.modBaseAddr);
+        if (target >= base && target < base + module.modBaseSize) {
+            std::ostringstream description;
+            description << encode_utf8(module.szModule) << "+0x" << std::hex
+                        << (target - base);
+            Handle process(OpenProcess(PROCESS_VM_READ, FALSE, process_id));
+            std::array<unsigned char, 16> bytes{};
+            SIZE_T read = 0;
+            if (process && ReadProcessMemory(process.get(), address, bytes.data(),
+                                             bytes.size(), &read) && read) {
+                description << " bytes";
+                for (SIZE_T index = 0; index < read; ++index) {
+                    description << ' ' << std::setw(2) << std::setfill('0')
+                                << static_cast<unsigned>(bytes[index]);
+                }
+            }
+            return description.str();
+        }
+    } while (Module32NextW(snapshot.get(), &module));
+    return {};
 }
 
 void inject_library(HANDLE process, DWORD process_id, const fs::path& dll_path) 
@@ -297,7 +360,9 @@ void run_x86_injector(const fs::path& injector, const fs::path& working_director
                       DWORD process_id, DWORD thread_id,
                       const fs::path& bootstrap, const std::string& service_host,
                       const std::string& lsx_host,
-                      const std::string& instance_name)
+                      const std::string& instance_name,
+                      bool standalone_shim = false,
+                      bool preserve_suspended = false)
 {
     std::wstring command_line = quote_argument(fs::absolute(injector).wstring());
     const auto append = [&command_line](std::wstring_view value)
@@ -305,12 +370,21 @@ void run_x86_injector(const fs::path& injector, const fs::path& working_director
         command_line.push_back(L' ');
         command_line += quote_argument(value);
     };
-    append(std::to_wstring(process_id));
-    append(std::to_wstring(thread_id));
-    append(fs::absolute(bootstrap).wstring());
-    append(std::wstring(service_host.begin(), service_host.end()));
-    append(std::wstring(lsx_host.begin(), lsx_host.end()));
-    append(std::wstring(instance_name.begin(), instance_name.end()));
+    if (standalone_shim) {
+        append(L"--inject-shim");
+        append(std::to_wstring(process_id));
+        append(std::to_wstring(thread_id));
+        append(fs::absolute(bootstrap).wstring());
+        append(std::wstring(service_host.begin(), service_host.end()));
+        if (preserve_suspended) append(L"--preserve-suspended");
+    } else {
+        append(std::to_wstring(process_id));
+        append(std::to_wstring(thread_id));
+        append(fs::absolute(bootstrap).wstring());
+        append(std::wstring(service_host.begin(), service_host.end()));
+        append(std::wstring(lsx_host.begin(), lsx_host.end()));
+        append(std::wstring(instance_name.begin(), instance_name.end()));
+    }
 
     std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
     mutable_command.push_back(L'\0');
@@ -413,22 +487,38 @@ void launch_x86_activation_monitor(const fs::path& injector,
 
 int wmain(int argc, wchar_t** argv) 
 {
+    if (argc == 2 && wcscmp(argv[1], L"--ea-client-stub") == 0) {
+        Sleep(1000);
+        return 0;
+    }
     try 
     {
+        std::array<wchar_t, 32768> launcher_path_buffer{};
+        const DWORD launcher_path_length = GetModuleFileNameW(
+            nullptr, launcher_path_buffer.data(),
+            static_cast<DWORD>(launcher_path_buffer.size()));
+        if (!launcher_path_length ||
+            launcher_path_length >= launcher_path_buffer.size()) {
+            fail(L"GetModuleFileNameW(launcher) failed");
+        }
+        const std::wstring launcher_executable(
+            launcher_path_buffer.data(), launcher_path_length);
         const Options options = parse_options(argc, argv);
         if (!fs::is_regular_file(options.game))
             throw std::runtime_error("Game executable does not exist: " + options.game.string());
         const PeArchitecture game_architecture = inspect_pe_architecture(options.game);
         std::cout << "Game architecture: "
                   << pe_architecture_name(game_architecture) << '\n';
-        if (!fs::is_regular_file(options.bootstrap_x86))
-            throw std::runtime_error("CLoaderx32.dll does not exist; pass --bootstrap-x86 <path>.");
-        if (!fs::is_regular_file(options.bootstrap))
-            throw std::runtime_error("CLoaderx64.dll does not exist; pass --bootstrap <path>.");
-        if (inspect_pe_architecture(options.bootstrap_x86) != PeArchitecture::i386)
-            throw std::runtime_error("--bootstrap-x86 must name an I386 PE32 image.");
-        if (inspect_pe_architecture(options.bootstrap) != PeArchitecture::amd64)
-            throw std::runtime_error("--bootstrap must name an AMD64 PE32+ image.");
+        if (!options.no_zlo_runtime) {
+            if (!fs::is_regular_file(options.bootstrap_x86))
+                throw std::runtime_error("CLoaderx32.dll does not exist; pass --bootstrap-x86 <path>.");
+            if (!fs::is_regular_file(options.bootstrap))
+                throw std::runtime_error("CLoaderx64.dll does not exist; pass --bootstrap <path>.");
+            if (inspect_pe_architecture(options.bootstrap_x86) != PeArchitecture::i386)
+                throw std::runtime_error("--bootstrap-x86 must name an I386 PE32 image.");
+            if (inspect_pe_architecture(options.bootstrap) != PeArchitecture::amd64)
+                throw std::runtime_error("--bootstrap must name an AMD64 PE32+ image.");
+        }
         if (game_architecture == PeArchitecture::i386 &&
             !fs::is_regular_file(options.injector_x86))
             throw std::runtime_error(
@@ -436,9 +526,14 @@ int wmain(int argc, wchar_t** argv)
         if (game_architecture == PeArchitecture::i386 &&
             inspect_pe_architecture(options.injector_x86) != PeArchitecture::i386)
             throw std::runtime_error("--injector-x86 must name an I386 PE32 executable.");
-        if (game_architecture == PeArchitecture::amd64 &&
-            !fs::is_regular_file(options.lsx_shim))
+        const fs::path& selected_shim = game_architecture == PeArchitecture::i386
+            ? options.lsx_shim_x86 : options.lsx_shim;
+        if ((options.no_zlo_runtime || game_architecture == PeArchitecture::amd64) &&
+            !fs::is_regular_file(selected_shim))
             throw std::runtime_error("ZClient.LsxShim64.dll does not exist; pass --lsx-shim <path>.");
+        if (options.no_zlo_runtime &&
+            inspect_pe_architecture(selected_shim) != game_architecture)
+            throw std::runtime_error("The standalone LSX shim architecture does not match the game.");
         if (game_architecture == PeArchitecture::i386 &&
             !options.trace_game_dll.empty())
             throw std::runtime_error(
@@ -484,7 +579,7 @@ int wmain(int argc, wchar_t** argv)
         std::unique_ptr<LsxServer> x86_lsx_server;
         std::unique_ptr<LicenseReplayServer> license_server;
         std::string x86_lsx_host = options.lsx_host;
-        if (game_architecture == PeArchitecture::i386)
+        if (game_architecture == PeArchitecture::i386 && !options.no_zlo_runtime)
         {
             x86_lsx_host = make_instance_lsx_host(GetCurrentProcessId());
             // CMainx32 is redirected to the legacy LSX port by the Win32
@@ -505,7 +600,7 @@ int wmain(int argc, wchar_t** argv)
         }
 
         std::function<void(DWORD)> activation_process_callback;
-        if (game_architecture == PeArchitecture::i386)
+        if (game_architecture == PeArchitecture::i386 && !options.no_zlo_runtime)
         {
             activation_process_callback = [&](DWORD process_id)
             {
@@ -514,45 +609,56 @@ int wmain(int argc, wchar_t** argv)
             };
         }
 
-        ZClientPipeHost pipe_host(options.client_token, pipe_name,
-                                  options.game_executable, options.module_id,
-                                  options.game_module_id, options.activation_executable,
-                                  options.activation_module_id,
-                                  std::move(activation_process_callback));
-        pipe_host.start();
+        std::unique_ptr<ZClientPipeHost> pipe_host;
+        if (!options.no_zlo_runtime) {
+            pipe_host = std::make_unique<ZClientPipeHost>(
+                options.client_token, pipe_name, options.game_executable,
+                options.module_id, options.game_module_id,
+                options.activation_executable, options.activation_module_id,
+                std::move(activation_process_callback));
+            pipe_host->start();
+        }
 
 
         // Some games start an x86 activation child. CLoader expects its raw PE
         // image in this shared, length-prefixed mapping before it can inject it.
-        const auto x86_loader_image = prepare_zclient_loader_names_only(
-            options.bootstrap_x86, instance_name);
-        SharedImageMapping x86_loader_map(x86_mapping_name.c_str(),
-                                          x86_loader_image);
-        std::wcout << L"Published x86 child bootstrap: "
-                   << fs::absolute(options.bootstrap_x86).wstring() 
-                   << L"\n";
+        std::unique_ptr<SharedImageMapping> x86_loader_map;
+        std::unique_ptr<SharedImageMapping> x64_loader_map;
+        if (!options.no_zlo_runtime) {
+            const auto x86_loader_image = prepare_zclient_loader_names_only(
+                options.bootstrap_x86, instance_name);
+            x86_loader_map = std::make_unique<SharedImageMapping>(
+                x86_mapping_name.c_str(), x86_loader_image);
+            std::wcout << L"Published x86 child bootstrap: "
+                       << fs::absolute(options.bootstrap_x86).wstring()
+                       << L"\n";
 
 
         // CLoader's process-creation hooks use the shared x64 image for later
         // x64 children. The initial game bootstrap is mapped directly below.
-        const auto x64_loader_image = prepare_zclient_loader_image(
-            options.bootstrap, options.service_host, instance_name);
-        SharedImageMapping x64_loader_map(x64_mapping_name.c_str(),
-                                          x64_loader_image);
-        std::wcout << L"Published x64 child bootstrap: "
-                   << fs::absolute(options.bootstrap).wstring() 
-                   << L"\n";
+            const auto x64_loader_image = prepare_zclient_loader_image(
+                options.bootstrap, options.service_host, instance_name);
+            x64_loader_map = std::make_unique<SharedImageMapping>(
+                x64_mapping_name.c_str(), x64_loader_image);
+            std::wcout << L"Published x64 child bootstrap: "
+                       << fs::absolute(options.bootstrap).wstring()
+                       << L"\n";
+        }
 
 
         // CMain does not enable its LSX socket send/receive hooks from ZLSX alone.
         // It also checks for this marker beside the game executable during ZLO
         // initialization. Without it the game reaches its window/message loop but
         // never exchanges the Origin LSX handshake and remains on a black screen.
-        ScopedMarkerFile lsx_marker(options.game.parent_path() / L"z1.dev");
-        std::wcout << L"CMain LSX marker "
-                   << (lsx_marker.created() ? L"created: " : L"already present: ")
-                   << (options.game.parent_path() / L"z1.dev").wstring() 
-                   << L"\n";
+        std::unique_ptr<ScopedMarkerFile> lsx_marker;
+        if (!options.no_zlo_runtime) {
+            lsx_marker = std::make_unique<ScopedMarkerFile>(
+                options.game.parent_path() / L"z1.dev");
+            std::wcout << L"CMain LSX marker "
+                       << (lsx_marker->created() ? L"created: " : L"already present: ")
+                       << (options.game.parent_path() / L"z1.dev").wstring()
+                       << L"\n";
+        }
 
 
         std::wstring command_line = quote_argument(options.game.wstring());
@@ -589,10 +695,14 @@ int wmain(int argc, wchar_t** argv)
         std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
         mutable_command.push_back(L'\0');
         std::uint32_t rtp_launch_code = 0;
+        const RuntimeProfile runtime_profile = make_runtime_profile(
+            options.compatibility_profile, options.activation_module_sha256);
         std::vector<wchar_t> environment = build_environment(
             options.content_id, options.game_id, options.game_title,
             effective_eaid, auth_token_wide,
             lsx_account_id, options.local_game_network, options.lsx_log,
+            options.no_zlo_runtime, options.service_host, launcher_executable,
+            options.client_token,
             &rtp_launch_code);
         std::wcout << L"EA launch environment: ContentId " << options.content_id
                    << L", game " << options.game_id << L", EAID " << effective_eaid
@@ -644,19 +754,30 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"Created suspended process " << info.dwProcessId << L"\n";
         if (game_architecture == PeArchitecture::i386)
         {
-            std::wcout << L"Mapping CLoaderx32 with the native Win32 injector...\n";
+            std::wcout << (options.no_zlo_runtime
+                ? L"Injecting standalone x86 LSX shim...\n"
+                : L"Mapping CLoaderx32 with the native Win32 injector...\n");
             run_x86_injector(
                 options.injector_x86, options.game.parent_path(),
-                info.dwProcessId, info.dwThreadId, options.bootstrap_x86,
-                options.service_host, x86_lsx_host, instance_name);
+                info.dwProcessId, info.dwThreadId,
+                options.no_zlo_runtime ? options.lsx_shim_x86 : options.bootstrap_x86,
+                options.service_host, x86_lsx_host, instance_name,
+                options.no_zlo_runtime);
         }
         else
         {
-            std::wcout << L"Mapping CLoaderx64 into the suspended game...\n";
-            (void)manual_map_zclient_loader(
-                process.get(), primary_thread.get(), info.dwProcessId,
-                options.bootstrap, options.service_host, options.lsx_host,
-                instance_name, options.lsx_shim);
+            if (options.no_zlo_runtime) {
+                std::wcout << L"Injecting standalone x64 LSX shim...\n";
+                preload_standalone_lsx_shim(
+                    process.get(), primary_thread.get(), info.dwProcessId,
+                    options.lsx_shim, options.service_host);
+            } else {
+                std::wcout << L"Mapping CLoaderx64 into the suspended game...\n";
+                (void)manual_map_zclient_loader(
+                    process.get(), primary_thread.get(), info.dwProcessId,
+                    options.bootstrap, options.service_host, options.lsx_host,
+                    instance_name, options.lsx_shim);
+            }
         }
 
         // sleep for 10 seconds
@@ -671,16 +792,199 @@ int wmain(int argc, wchar_t** argv)
         if (!options.trace_game_dll.empty())
             inject_library(process.get(), info.dwProcessId, options.trace_game_dll);
 
-        // Keep the job handle and the launcher-owned loader context alive until
-        // the game exits, matching ZClient's ownership model.
-        for (;;) 
-        {
-            const DWORD wait = WaitForSingleObject(process.get(), 1);
-            if (wait == WAIT_OBJECT_0) break;
-            if (wait == WAIT_FAILED) fail(L"WaitForSingleObject(game) failed");
+        // Inject the root through its ordinary CREATE_SUSPENDED state first.
+        // DEBUG_PROCESS adds a debugger suspension that survives the initial
+        // event on some Windows versions and prevents the loader gate from
+        // running. Attaching afterward preserves descendant propagation while
+        // avoiding that extra root-thread suspend count. Attach-time LOAD_DLL
+        // events also enumerate modules already loaded for title profiles.
+        if (options.no_zlo_runtime &&
+            !DebugActiveProcess(info.dwProcessId)) {
+            fail(L"DebugActiveProcess(child propagation) failed");
         }
+
+        // DEBUG_PROCESS propagates to descendants. Every CREATE_PROCESS event
+        // is delivered before the new entry point can execute, which gives the
+        // shim-only path the same early-injection guarantee CLoader provided.
         DWORD exit_code = 0;
-        GetExitCodeProcess(process.get(), &exit_code);
+        if (options.no_zlo_runtime) {
+            bool root_exited = false;
+            while (!root_exited) {
+                DEBUG_EVENT event{};
+                if (!WaitForDebugEventEx(&event, 100)) {
+                    if (GetLastError() == ERROR_SEM_TIMEOUT) continue;
+                    fail(L"WaitForDebugEventEx failed");
+                }
+                DWORD continuation = DBG_CONTINUE;
+                bool already_continued = false;
+                HANDLE event_file = nullptr;
+                HANDLE event_process = nullptr;
+                HANDLE event_thread = nullptr;
+                try {
+                    switch (event.dwDebugEventCode) {
+                    case CREATE_PROCESS_DEBUG_EVENT: {
+                        const auto& created = event.u.CreateProcessInfo;
+                        event_file = created.hFile;
+                        event_process = created.hProcess;
+                        event_thread = created.hThread;
+                        if (event.dwProcessId != info.dwProcessId) {
+                            const fs::path child_path = debug_image_path(created.hFile);
+                            if (child_path.empty())
+                                throw std::runtime_error("Could not identify a child executable for shim propagation.");
+                            if (_wcsicmp(fs::absolute(child_path).c_str(),
+                                        fs::absolute(launcher_executable).c_str()) == 0) {
+                                std::wcout << L"Allowed EA client surrogate child "
+                                           << event.dwProcessId << L"\n";
+                                break;
+                            }
+                            const PeArchitecture child_architecture =
+                                inspect_pe_architecture(child_path);
+                            std::wcout << L"Propagating standalone shim to child "
+                                       << child_path.filename().wstring() << L" ("
+                                       << event.dwProcessId << L")\n";
+                            // A debug stop blocks every remote thread. Add a
+                            // normal suspend count, release the debug event,
+                            // inject, then remove only our suspension. If the
+                            // creator requested CREATE_SUSPENDED, its original
+                            // count is preserved for the parent to release.
+                            const DWORD previous_suspend = SuspendThread(created.hThread);
+                            if (previous_suspend == DWORD(-1))
+                                fail(L"SuspendThread(child propagation) failed");
+                            if (previous_suspend > 1)
+                                throw std::runtime_error("Child primary thread has an unsupported suspend count greater than one.");
+                            if (!ContinueDebugEvent(event.dwProcessId,
+                                                    event.dwThreadId,
+                                                    DBG_CONTINUE))
+                                fail(L"ContinueDebugEvent(child creation) failed");
+                            already_continued = true;
+                            if (previous_suspend == 1 &&
+                                ResumeThread(created.hThread) == DWORD(-1))
+                                fail(L"Normalize child suspension failed");
+                            if (child_architecture == PeArchitecture::i386) {
+                                run_x86_injector(
+                                    options.injector_x86, child_path.parent_path(),
+                                    event.dwProcessId, event.dwThreadId,
+                                    options.lsx_shim_x86, options.service_host,
+                                    x86_lsx_host, instance_name, true,
+                                    previous_suspend == 1);
+                            } else if (child_architecture == PeArchitecture::amd64) {
+                                preload_standalone_lsx_shim(
+                                    created.hProcess, created.hThread,
+                                    event.dwProcessId, options.lsx_shim,
+                                    options.service_host,
+                                    previous_suspend == 1);
+                            } else {
+                                throw std::runtime_error("A child executable has an unsupported architecture.");
+                            }
+                        }
+                        break;
+                    }
+                    case LOAD_DLL_DEBUG_EVENT: {
+                        event_file = event.u.LoadDll.hFile;
+                        if (!runtime_profile.name.empty()) {
+                            Handle target(OpenProcess(
+                                PROCESS_QUERY_LIMITED_INFORMATION |
+                                PROCESS_VM_OPERATION | PROCESS_VM_READ |
+                                PROCESS_VM_WRITE,
+                                FALSE, event.dwProcessId));
+                            if (!target) fail(L"OpenProcess(profile target) failed");
+                            (void)apply_runtime_profile_module(
+                                runtime_profile, target.get(),
+                                event.u.LoadDll.hFile,
+                                event.u.LoadDll.lpBaseOfDll);
+                        }
+                        break;
+                    }
+                    case EXIT_PROCESS_DEBUG_EVENT:
+                        if (event.dwProcessId == info.dwProcessId) {
+                            exit_code = event.u.ExitProcess.dwExitCode;
+                            root_exited = true;
+                        }
+                        break;
+                    case EXCEPTION_DEBUG_EVENT:
+                        // 0x406D1388 is the conventional MSVC thread-name
+                        // notification. A debugger consumes it silently.
+                        if (event.u.Exception.ExceptionRecord.ExceptionCode == 0x406D1388) {
+                            continuation = DBG_CONTINUE;
+                        } else if (event.u.Exception.ExceptionRecord.ExceptionCode != EXCEPTION_BREAKPOINT &&
+                            event.u.Exception.ExceptionRecord.ExceptionCode != DBG_PRINTEXCEPTION_C &&
+                            event.u.Exception.ExceptionRecord.ExceptionCode != DBG_PRINTEXCEPTION_WIDE_C) {
+                            std::cerr << "Debug exception 0x" << std::hex
+                                      << event.u.Exception.ExceptionRecord.ExceptionCode
+                                      << " at 0x"
+                                      << reinterpret_cast<std::uintptr_t>(
+                                             event.u.Exception.ExceptionRecord.ExceptionAddress)
+                                      << std::dec
+                                      << (event.u.Exception.dwFirstChance
+                                              ? " (first chance)\n"
+                                              : " (second chance)\n");
+                            const std::string site = describe_exception_site(
+                                event.dwProcessId,
+                                event.u.Exception.ExceptionRecord.ExceptionAddress);
+                            if (!site.empty())
+                                std::cerr << "  exception site: " << site << '\n';
+                            continuation = DBG_EXCEPTION_NOT_HANDLED;
+                        }
+                        break;
+                    case OUTPUT_DEBUG_STRING_EVENT: {
+                        const auto& output = event.u.DebugString;
+                        const SIZE_T character_size = output.fUnicode
+                            ? sizeof(wchar_t) : sizeof(char);
+                        const SIZE_T bytes = static_cast<SIZE_T>(output.nDebugStringLength) *
+                                             character_size;
+                        if (output.lpDebugStringData && bytes && bytes <= 64 * 1024) {
+                            Handle source(OpenProcess(PROCESS_VM_READ, FALSE,
+                                                      event.dwProcessId));
+                            std::vector<std::uint8_t> text(bytes + character_size, 0);
+                            SIZE_T read = 0;
+                            if (source && ReadProcessMemory(
+                                    source.get(), output.lpDebugStringData,
+                                    text.data(), bytes, &read) && read) {
+                                if (output.fUnicode) {
+                                    const auto* wide = reinterpret_cast<const wchar_t*>(text.data());
+                                    std::wcout << wide;
+                                } else {
+                                    std::cout << reinterpret_cast<const char*>(text.data());
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                } catch (...) {
+                    if (event_file && event_file != INVALID_HANDLE_VALUE) CloseHandle(event_file);
+                    if (event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
+                        if (event_thread && event_thread != primary_thread.get())
+                            CloseHandle(event_thread);
+                        if (event_process && event_process != process.get())
+                            CloseHandle(event_process);
+                    }
+                    if (!already_continued)
+                        ContinueDebugEvent(event.dwProcessId, event.dwThreadId,
+                                           DBG_EXCEPTION_NOT_HANDLED);
+                    throw;
+                }
+                if (event_file && event_file != INVALID_HANDLE_VALUE) CloseHandle(event_file);
+                if (event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
+                    if (event_thread && event_thread != primary_thread.get())
+                        CloseHandle(event_thread);
+                    if (event_process && event_process != process.get())
+                        CloseHandle(event_process);
+                }
+                if (!already_continued &&
+                    !ContinueDebugEvent(event.dwProcessId, event.dwThreadId, continuation))
+                    fail(L"ContinueDebugEvent failed");
+            }
+        } else {
+            for (;;) {
+                const DWORD wait = WaitForSingleObject(process.get(), 1);
+                if (wait == WAIT_OBJECT_0) break;
+                if (wait == WAIT_FAILED) fail(L"WaitForSingleObject(game) failed");
+            }
+            GetExitCodeProcess(process.get(), &exit_code);
+        }
 
         std::wcout << options.game.filename().wstring() 
                    << L" exited with code "

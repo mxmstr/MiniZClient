@@ -14,6 +14,18 @@
 
 namespace fs = std::filesystem;
 
+using BCryptVerifySignatureProc = LONG (WINAPI*)(
+    void*, void*, unsigned char*, ULONG, unsigned char*, ULONG, ULONG);
+
+bool verify_signature_override() {
+    HMODULE bcrypt = GetModuleHandleW(L"bcrypt.dll");
+    if (!bcrypt) bcrypt = LoadLibraryW(L"bcrypt.dll");
+    if (!bcrypt) return false;
+    const auto verify = reinterpret_cast<BCryptVerifySignatureProc>(
+        GetProcAddress(bcrypt, "BCryptVerifySignature"));
+    return verify && verify(nullptr, nullptr, nullptr, 0, nullptr, 0, 0) == 0;
+}
+
 template <typename To, typename From>
 To function_cast(From value) {
     static_assert(sizeof(To) == sizeof(From));
@@ -26,14 +38,14 @@ using GetAdaptersAddressesProc = ULONG (WINAPI*)(
     ULONG, ULONG, PVOID, PIP_ADAPTER_ADDRESSES, PULONG);
 GetAdaptersAddressesProc cached_get_adapters_addresses = &GetAdaptersAddresses;
 
-bool verify_redirect(std::uint16_t port) {
+bool verify_redirect(std::uint16_t port, const char* host = "203.0.113.1") {
     SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (client == INVALID_SOCKET) return false;
 
     sockaddr_in destination{};
     destination.sin_family = AF_INET;
     destination.sin_port = htons(port);
-    InetPtonA(AF_INET, "203.0.113.1", &destination.sin_addr);
+    InetPtonA(AF_INET, host, &destination.sin_addr);
     if (connect(client, reinterpret_cast<const sockaddr*>(&destination),
                 sizeof(destination)) == SOCKET_ERROR) {
         std::cerr << "connect to logical LSX port " << port
@@ -48,6 +60,115 @@ bool verify_redirect(std::uint16_t port) {
     if (received <= 0) return false;
     const std::string challenge(buffer, static_cast<std::size_t>(received));
     return challenge.find("<Challenge key=") != std::string::npos;
+}
+
+bool verify_opcode2_redirect(std::uint16_t port) {
+    SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (client == INVALID_SOCKET) return false;
+    sockaddr_in destination{};
+    destination.sin_family = AF_INET;
+    destination.sin_port = htons(port);
+    destination.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    static constexpr unsigned char request[] = {0x02, 0, 0, 0, 0};
+    unsigned char reply[10]{};
+    const bool identity_ok =
+        connect(client, reinterpret_cast<const sockaddr*>(&destination),
+                sizeof(destination)) == 0 &&
+        send(client, reinterpret_cast<const char*>(request), sizeof(request), 0) ==
+            sizeof(request) &&
+        recv(client, reinterpret_cast<char*>(reply), sizeof(reply), MSG_WAITALL) ==
+            sizeof(reply) &&
+        reply[0] == 0x02 && reply[4] == 0x05 && reply[5] == 0x01 &&
+        reply[6] == 0xa0 && reply[7] == 0x00 && reply[8] == 0x00 &&
+        reply[9] == 0x09;
+    DWORD timeout = 150;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    char unexpected{};
+    const int extra = identity_ok ? recv(client, &unexpected, 1, 0) : 0;
+    const bool ok = identity_ok && extra == SOCKET_ERROR &&
+                    WSAGetLastError() == WSAETIMEDOUT;
+    closesocket(client);
+    return ok;
+}
+
+bool verify_rivals_redirect() {
+    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET) return false;
+
+    BOOL exclusive = TRUE;
+    setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
+    sockaddr_in listen_address{};
+    listen_address.sin_family = AF_INET;
+    listen_address.sin_port = htons(47127);
+    listen_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(listener, reinterpret_cast<const sockaddr*>(&listen_address),
+             sizeof(listen_address)) == SOCKET_ERROR ||
+        listen(listener, 2) == SOCKET_ERROR) {
+        std::cerr << "could not listen on the translated Rivals port: "
+                  << WSAGetLastError() << '\n';
+        closesocket(listener);
+        return false;
+    }
+
+    sockaddr_in logical_address{};
+    logical_address.sin_family = AF_INET;
+    logical_address.sin_port = htons(42127);
+    logical_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bool ok = true;
+    for (unsigned attempt = 0; attempt != 2; ++attempt) {
+        SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (client == INVALID_SOCKET) {
+            ok = false;
+            break;
+        }
+        const int result = attempt == 0
+            ? connect(client, reinterpret_cast<const sockaddr*>(&logical_address),
+                      sizeof(logical_address))
+            : WSAConnect(client,
+                         reinterpret_cast<const sockaddr*>(&logical_address),
+                         sizeof(logical_address), nullptr, nullptr, nullptr,
+                         nullptr);
+        if (result == SOCKET_ERROR) {
+            std::cerr << "Rivals logical redirector connect failed: "
+                      << WSAGetLastError() << '\n';
+            closesocket(client);
+            ok = false;
+            break;
+        }
+        SOCKET accepted = accept(listener, nullptr, nullptr);
+        if (accepted == INVALID_SOCKET) ok = false;
+        else closesocket(accepted);
+        closesocket(client);
+        if (!ok) break;
+    }
+    closesocket(listener);
+    return ok;
+}
+
+bool verify_ea_client_surrogate() {
+    std::wstring command =
+        L"\"C:\\Program Files\\Electronic Arts\\EA Desktop\\EA Desktop\\EADesktop.exe\"";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    const BOOL created = CreateProcessW(
+        nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+        nullptr, nullptr, &startup, &process);
+    if (!created) {
+        std::cerr << "EA client surrogate creation failed: " << GetLastError()
+                  << '\n';
+        return false;
+    }
+    CloseHandle(process.hThread);
+    const DWORD wait = WaitForSingleObject(process.hProcess, 5000);
+    DWORD exit_code = 1;
+    const bool ok = wait == WAIT_OBJECT_0 &&
+                    GetExitCodeProcess(process.hProcess, &exit_code) &&
+                    exit_code == 0;
+    CloseHandle(process.hProcess);
+    return ok;
 }
 
 std::uint32_t identity_id_for(std::string_view name) {
@@ -203,14 +324,25 @@ bool verify_game_bind() {
     return ok;
 }
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && wcscmp(argv[1], L"--ea-client-stub") == 0) return 0;
+    wchar_t launcher_stub_path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, launcher_stub_path, MAX_PATH)) return 10;
     SetEnvironmentVariableW(L"EALaunchEAID", L"shim-test");
-    SetEnvironmentVariableW(L"ContentId", L"test-content");
+    SetEnvironmentVariableW(L"ContentId", L"1013163");
     SetEnvironmentVariableW(L"ZCLIENT_GAME_TITLE", L"Shim Test Game");
+    SetEnvironmentVariableW(L"ZCLIENT_SERVICE_HOST", L"127.0.0.1");
+    SetEnvironmentVariableW(L"ZCLIENT_LAUNCHER_EXECUTABLE",
+                            launcher_stub_path);
     SetEnvironmentVariableW(L"EALaunchUserAuthToken", L"ZLOCAL1:7368696d2d74657374");
     SetEnvironmentVariableW(L"ZCLIENT_LSX_ACCOUNT_ID", L"42");
     SetEnvironmentVariableW(L"ZCLIENT_LOCAL_GAME_NETWORK", L"1");
     SetEnvironmentVariableW(L"ZCLIENT_LSX_LOG", L"0");
+#ifdef ZCLIENT_TEST_STANDALONE_SHIM
+    SetEnvironmentVariableW(L"ZCLIENT_LSX_STANDALONE", L"1");
+#else
+    SetEnvironmentVariableW(L"ZCLIENT_LSX_STANDALONE", nullptr);
+#endif
 
     const std::wstring ready_name = L"Local\\ZClient_LsxShimReady_" +
                                     std::to_wstring(GetCurrentProcessId());
@@ -234,12 +366,13 @@ int wmain() {
     if (fs::exists(unexpected_log)) return 9;
     CloseHandle(ready);
 
-    // The early phase must virtualize machine identity before CLoader/ZLO run,
-    // while leaving the Winsock hooks disabled until the launcher explicitly
-    // activates them after ZLO.
+    // The compatibility path waits for the launcher after CLoader/ZLO. The
+    // standalone path activates itself as soon as initialization is complete.
     const bool virtual_machine_identity = verify_machine_identity();
+#ifndef ZCLIENT_TEST_STANDALONE_SHIM
     const bool winsock_still_original =
         GetProcAddress(winsock, "connect") == connect_before_shim;
+#endif
     const std::wstring process_suffix = std::to_wstring(GetCurrentProcessId());
     const std::wstring enable_name =
         L"Local\\ZClient_LsxShimEnableNetwork_" + process_suffix;
@@ -249,9 +382,14 @@ int wmain() {
                                        enable_name.c_str());
     HANDLE network_ready = OpenEventW(SYNCHRONIZE, FALSE,
                                       network_ready_name.c_str());
-    if (!virtual_machine_identity || !winsock_still_original ||
+    if (!virtual_machine_identity ||
+#ifndef ZCLIENT_TEST_STANDALONE_SHIM
+        !winsock_still_original ||
+#endif
         !enable_network || !network_ready ||
+#ifndef ZCLIENT_TEST_STANDALONE_SHIM
         !SetEvent(enable_network) ||
+#endif
         WaitForSingleObject(network_ready, 10000) != WAIT_OBJECT_0) {
         if (enable_network) CloseHandle(enable_network);
         if (network_ready) CloseHandle(network_ready);
@@ -266,12 +404,30 @@ int wmain() {
     if (!winsock_was_activated || WSAStartup(MAKEWORD(2, 2), &data) != 0) {
         return 7;
     }
+    const bool redirected_3216 = verify_redirect(3216);
     const bool redirected_6176 = verify_redirect(6176);
     const bool redirected_8216 = verify_redirect(8216);
+#ifdef ZCLIENT_TEST_STANDALONE_SHIM
+    const bool accepted_opcode2 = verify_opcode2_redirect(48377);
+    const bool redirected_translated_lsx = verify_redirect(48378, "127.0.0.1");
+    const bool redirected_ea_client = verify_ea_client_surrogate();
+    const bool accepted_signature = verify_signature_override();
+#else
+    const bool accepted_opcode2 = true;
+    const bool redirected_translated_lsx = true;
+    const bool redirected_ea_client = true;
+    const bool accepted_signature = true;
+#endif
     const bool redirected_game_port = verify_game_bind();
+    const bool redirected_rivals_port = verify_rivals_redirect();
     WSACleanup();
-    if (!redirected_6176 || !redirected_8216 || !redirected_game_port ||
+    if (!redirected_3216 || !redirected_6176 || !redirected_8216 ||
+        !accepted_opcode2 || !redirected_translated_lsx ||
+        !redirected_game_port ||
+        !redirected_rivals_port ||
+        !redirected_ea_client ||
+        !accepted_signature ||
         !virtual_machine_identity) return 8;
-    std::cout << "LSX shim redirected LSX, isolated UDP, and virtualized the machine identity\n";
+    std::cout << "LSX shim redirected LSX and Rivals, isolated UDP, and virtualized the machine identity\n";
     return 0;
 }

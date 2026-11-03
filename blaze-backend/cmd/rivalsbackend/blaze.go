@@ -18,6 +18,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -26,6 +27,7 @@ import (
 const maxBlazeFrame = 16 << 20
 
 const legacyZLOAuthToken = "WAHAHA_IMMA_ZLO_TOKEN"
+const localZLOAuthTokenPrefix = legacyZLOAuthToken + ":ZLOCAL1:"
 
 //go:embed blaze_replay.json
 var blazeReplayJSON []byte
@@ -95,6 +97,12 @@ func gameVirtualAddressForPort(port int64) int64 {
 	return int64(0xc6120000 | uint32(port))
 }
 
+func localIdentityTransportID(name []byte) int64 {
+	hash := fnv.New32a()
+	_, _ = hash.Write(name)
+	return int64(hash.Sum32()&0x3fffffff) + 0x1000
+}
+
 func localBlazeIdentity(request []byte) (*blazeIdentity, error) {
 	packet, err := decodePacket(request)
 	if err != nil {
@@ -108,6 +116,24 @@ func localBlazeIdentity(request []byte) (*blazeIdentity, error) {
 	if !ok {
 		return nil, errors.New("AUTH is not a string")
 	}
+	if strings.HasPrefix(string(token), localZLOAuthTokenPrefix) {
+		encoded := string(token[len(localZLOAuthTokenPrefix):])
+		separator := strings.LastIndexByte(encoded, ':')
+		if separator <= 0 || separator == len(encoded)-1 {
+			return nil, errors.New("invalid configured local identity token")
+		}
+		name, decodeErr := hex.DecodeString(encoded[:separator])
+		id, idErr := strconv.ParseInt(encoded[separator+1:], 10, 64)
+		if decodeErr != nil || idErr != nil || id <= 0 || len(name) == 0 ||
+			len(name) > 64 || !utf8.Valid(name) {
+			return nil, errors.New("invalid configured local identity token")
+		}
+		transportID := localIdentityTransportID(name)
+		return &blazeIdentity{
+			name: string(name), token: append([]byte(nil), token...), id: id,
+			gamePort: gamePortForIdentity(transportID),
+		}, nil
+	}
 	const prefix = "ZLOCAL1:"
 	if !strings.HasPrefix(string(token), prefix) {
 		return &blazeIdentity{name: "mxmstr", token: append([]byte(nil), token...), id: 2}, nil
@@ -116,9 +142,7 @@ func localBlazeIdentity(request []byte) (*blazeIdentity, error) {
 	if err != nil || len(name) == 0 || len(name) > 64 || !utf8.Valid(name) {
 		return nil, errors.New("invalid local identity token")
 	}
-	hash := fnv.New32a()
-	_, _ = hash.Write(name)
-	id := int64(hash.Sum32()&0x3fffffff) + 0x1000
+	id := localIdentityTransportID(name)
 	return &blazeIdentity{
 		name: string(name), token: append([]byte(nil), token...), id: id,
 		gamePort: gamePortForIdentity(id),
@@ -134,7 +158,8 @@ func (s *blazeServer) blazeIdentity(request []byte) (*blazeIdentity, error) {
 	}
 	identity.name = s.legacyEAID
 	identity.id = s.legacyAccount
-	identity.gamePort = gamePortForIdentity(identity.id)
+	identity.gamePort = gamePortForIdentity(
+		localIdentityTransportID([]byte(identity.name)))
 	return identity, nil
 }
 
@@ -1944,6 +1969,17 @@ func (s *blazeServer) handle(connection net.Conn) {
 				log.Printf("Blaze reply to %s failed: %v", remote, err)
 				return
 			}
+			if s.nfs13 {
+				removed, removeErr := nfs13PlayerRemovedNotification(request)
+				if removeErr != nil {
+					log.Printf("Blaze NFS13 remove-player notification failed: %v", removeErr)
+					return
+				}
+				if _, err := connection.Write(removed); err != nil {
+					log.Printf("Blaze NFS13 remove-player notification write failed: %v", err)
+					return
+				}
+			}
 			if lobbyKey != "" && s.registry != nil {
 				s.registry.leave(lobbyKey)
 				lobbyKey = ""
@@ -2007,7 +2043,13 @@ func (s *blazeServer) handle(connection net.Conn) {
 			continue
 		}
 		var replies [][]byte
-		if component == 4 && command == 3 {
+		if s.nfs13 && component == 7 && (command == 4 || command == 16) {
+			replies, err = nfs13StatsReplies(request)
+			if err != nil {
+				log.Printf("NFS13 stats request invalid: %v", err)
+				return
+			}
+		} else if component == 4 && command == 3 {
 			replies, err = advanceGameStateReplies(request)
 			if err != nil {
 				log.Printf("Blaze advance-state request from %s is invalid: %v", remote, err)
@@ -2058,19 +2100,32 @@ func (s *blazeServer) handle(connection net.Conn) {
 		}
 		log.Printf("Blaze request component=%d command=%d correlation=%d replies=%d", component, command, correlation, len(replies))
 		for _, normalizedReply := range replies {
-			reply, refreshed, err := personalizeReplayReply(normalizedReply, time.Now().Unix(), identity)
+			// resetDedicatedServer returns JoinGameResponse, not a void ack.
+			// Wait until registry allocation has finalized GAME.GID so the RPC
+			// response and subsequent setup bind to the same SDK job.
+			if s.nfs13 && component == 4 && command == 25 {
+				c, cmd, kind, _ := blazeMetadata(normalizedReply)
+				if c == 4 && cmd == 25 && kind == 1 {
+					continue
+				}
+			}
+			reply, refreshed := append([]byte(nil), normalizedReply...), 0
+			// Generated stats carry a boolean LAST completion marker, not a
+			// timestamp. They already contain the live request's VID and scope.
+			if !(s.nfs13 && component == 7 && (command == 4 || command == 16)) {
+				reply, refreshed, err = personalizeReplayReply(normalizedReply, time.Now().Unix(), identity)
+			}
 			if err != nil {
 				log.Printf("Blaze replay time refresh failed: %v", err)
 				return
 			}
 			replyComponent, replyCommand, replyType, _ := blazeMetadata(reply)
-			if s.nfs13 && component == 7 && (command == 4 || command == 16) {
-				reply, err = nfs13StatsReply(request, reply)
+			if s.nfs13 {
+				reply, err = nfs13SessionDataReply(reply)
 				if err != nil {
-					log.Printf("Blaze NFS13 Stats compatibility rewrite failed: %v", err)
+					log.Printf("Blaze NFS13 session data rewrite failed: %v", err)
 					return
 				}
-				replyComponent, replyCommand, replyType, _ = blazeMetadata(reply)
 			}
 			if s.nfs13 && component == 1 && command == 152 &&
 				replyComponent == 0x7802 && (replyCommand == 2 || replyCommand == 5) && replyType == 2 {
@@ -2149,6 +2204,16 @@ func (s *blazeServer) handle(connection net.Conn) {
 			if replyType == 1 || replyType == 3 {
 				setBlazeCorrelation(reply, correlation)
 			}
+			if s.nfs13 && component == 4 && command == 25 && replyComponent == 4 && replyCommand == 20 && replyType == 2 {
+				resetReply, resetErr := nfs13ResetResponse(request, reply)
+				if resetErr != nil {
+					log.Printf("Blaze reset response failed: %v", resetErr)
+					return
+				}
+				if _, err := connection.Write(resetReply); err != nil {
+					return
+				}
+			}
 			if _, err := connection.Write(reply); err != nil {
 				log.Printf("Blaze reply to %s failed: %v", remote, err)
 				return
@@ -2192,15 +2257,38 @@ func (s *blazeServer) nfs13ResetDedicatedServerReplies(request []byte) ([][]byte
 	if component != 4 || command != 25 || messageType != 0 {
 		return nil, errors.New("not a GameManager reset-dedicated-server request")
 	}
-	reply, err := emptySuccessReply(request)
-	if err != nil {
-		return nil, err
-	}
 	setup := s.nfs13GameSetupReplay()
 	if len(setup) == 0 {
 		return nil, errors.New("replay corpus lacks a GameManager setup notification")
 	}
+	reply, err := nfs13ResetResponse(request, setup)
+	if err != nil {
+		return nil, err
+	}
 	return [][]byte{reply, setup}, nil
+}
+
+// FUN_00ba5e20 copies the response's 64-bit game ID into the pending reset job
+// and indexes that job by the ID. An empty success binds it to zero instead of
+// the announced game, leaving the title's create action waiting indefinitely.
+func nfs13ResetResponse(request, setup []byte) ([]byte, error) {
+	p, err := decodePacket(setup)
+	if err != nil {
+		return nil, err
+	}
+	game, err := structField(p.Fields, "GAME")
+	if err != nil {
+		return nil, err
+	}
+	id, err := integerField(game, "GID")
+	if err != nil || id <= 0 {
+		return nil, errors.New("reset setup has no valid game ID")
+	}
+	ack, err := emptySuccessReply(request)
+	if err != nil {
+		return nil, err
+	}
+	return (Packet{Header: ack[:12], Fields: []Field{{Tag: "GID", Kind: 0, Value: id}}}).Encode()
 }
 
 func prepareReplayReply(frame []byte, now int64) ([]byte, int, error) {
@@ -2287,7 +2375,7 @@ func (s *blazeServer) findReplay(request []byte, cursor int) (index int, exact b
 	// are likewise used as typed templates and rewritten from live state. Reuse
 	// the latest response bundle after the ordered cursor has advanced. The game
 	// report bundle includes its result notice.
-	if (component == 0x7802 && (command == 13 || command == 20)) ||
+	if ((component == 0x7802 || component == 0x802) && (command == 13 || command == 20)) ||
 		(component == 9 && (command == 8 || command == 10)) ||
 		(component == 25 && command == 6) ||
 		(component == 4 && command == 13) ||

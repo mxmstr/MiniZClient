@@ -1,0 +1,12 @@
+{
+  "source": "https://cdn.zloemu.net/games/",
+  "headers": [
+    "0007e016",
+    "000003f7",
+    "000011b3"
+  ],
+  "objects": 1015,
+  "bytes": 19311644,
+  "sha256": "3641e9505ba7549512621648ec3289e422526021cf7e6b57b0d6320c9000469b",
+  "largest_object": 174428
+}

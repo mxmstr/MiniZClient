@@ -172,17 +172,23 @@ func main() {
 			log.Fatal(err)
 		}
 		blaze.nfs13 = *profile == "nfs13-probe"
-		if *profile == "nfs13-probe" {
-			blaze.legacyEAID = *nfs13EAID
-			blaze.legacyAccount = *nfs13Account
-			blaze.rewritePreAuth = *nfs13RewritePreAuth
+		if *profile == "rivals" || *profile == "nfs13-probe" {
+			// Rivals' ProtoSSL/DirtySSL parser has the same compact certificate
+			// flight constraint as the older profile. Use the recovered ZLO leaf
+			// directly instead of the larger generated certificate, which makes
+			// the client stop after ServerHello without sending ClientKeyExchange.
 			certificate, certificateErr := compactLegacyServiceCertificate(*advertiseHost)
 			if certificateErr != nil {
 				log.Fatal(certificateErr)
 			}
 			blaze.tlsConfig.Certificates = []tls.Certificate{certificate}
-			log.Printf("NFS13 compact SSL3 leaf configured (DER bytes=%d)",
-				len(certificate.Certificate[0]))
+			log.Printf("%s compact ZLO TLS leaf configured (DER bytes=%d)",
+				*profile, len(certificate.Certificate[0]))
+		}
+		if *profile == "nfs13-probe" {
+			blaze.legacyEAID = *nfs13EAID
+			blaze.legacyAccount = *nfs13Account
+			blaze.rewritePreAuth = *nfs13RewritePreAuth
 		}
 		blaze.registry = reg
 		if !*disableBlaze && *profile != "nfs13-probe" {
@@ -196,9 +202,8 @@ func main() {
 			if splitErr != nil {
 				log.Fatalf("invalid -blaze-listen address: %v", splitErr)
 			}
-			redirectorListener, err = net.Listen("tcp", *redirectorListen)
-			if err != nil {
-				log.Fatalf("listen for Blaze redirector on %s: %v", *redirectorListen, err)
+			if _, _, splitErr = net.SplitHostPort(*redirectorListen); splitErr != nil {
+				log.Fatalf("invalid -redirector-listen address: %v", splitErr)
 			}
 		}
 	}
@@ -248,6 +253,19 @@ func main() {
 			serverErrors <- serveSSL3Redirector(serviceContext, *redirectorListen,
 				blaze.tlsConfig.Certificates[0], *advertiseHost, uint16(blazePortValue),
 				redirectorCapture, secureBlaze)
+		}()
+	}
+	if !*disableRedirector && *profile == "rivals" {
+		_, blazePortText, _ := net.SplitHostPort(*blazeListen)
+		blazePortValue, parseErr := strconv.ParseUint(blazePortText, 10, 16)
+		if parseErr != nil || blazePortValue == 0 {
+			log.Fatalf("invalid -blaze-listen port %q", blazePortText)
+		}
+		go func() {
+			redirectorCapture := strings.TrimSuffix(*capture, filepath.Ext(*capture)) + "_redirector" + filepath.Ext(*capture)
+			serverErrors <- serveRivalsTLS11Redirector(serviceContext, *redirectorListen,
+				blaze.tlsConfig.Certificates[0], *advertiseHost, uint16(blazePortValue),
+				redirectorCapture)
 		}()
 	}
 	if !*disableBlaze && *profile == "nfs13-probe" {

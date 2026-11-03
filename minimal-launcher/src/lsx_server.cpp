@@ -32,8 +32,16 @@ constexpr std::array<unsigned char, 16> kDefaultKey = {
 };
 constexpr std::string_view kChallenge = "cacf897a20b6d612ad0c05e011df52bb";
 constexpr std::string_view kZloAuthToken = "WAHAHA_IMMA_ZLO_TOKEN";
+constexpr std::string_view kLocalAuthTokenPrefix = "ZLOCAL1:";
 
 std::mutex g_output_mutex;
+
+void debug_lsx(std::string_view message) {
+    std::string output = "[ZClient.LSX] ";
+    output.append(message);
+    if (output.empty() || output.back() != '\n') output.push_back('\n');
+    OutputDebugStringA(output.c_str());
+}
 
 std::string narrow(std::wstring_view value) 
 {
@@ -289,18 +297,26 @@ std::string services_response()
 
 LsxServer::LsxServer(std::string bind_host, std::uint16_t port, std::wstring eaid,
                      std::wstring content_id, std::string auth_token, std::string game_title,
-                     std::uint64_t account_id)
+                     std::uint64_t account_id, std::uint32_t client_token)
     : impl_(std::make_unique<Impl>(std::move(bind_host), port, std::move(eaid),
                                    std::move(content_id), std::move(auth_token),
-                                   std::move(game_title), account_id)) {}
+                                   std::move(game_title), account_id, client_token)) {}
                                    
 LsxServer::~LsxServer() = default;
 
 LsxServer::Impl::Impl(std::string bind_host, std::uint16_t port, std::wstring eaid, std::wstring content_id,
          std::string auth_token, std::string game_title, std::uint64_t account_id)
+    : Impl(std::move(bind_host), port, std::move(eaid), std::move(content_id),
+           std::move(auth_token), std::move(game_title), account_id,
+           0xa0000009u) {}
+
+LsxServer::Impl::Impl(std::string bind_host, std::uint16_t port, std::wstring eaid,
+         std::wstring content_id, std::string auth_token, std::string game_title,
+         std::uint64_t account_id, std::uint32_t client_token)
         : port_(port), eaid_(narrow(eaid)), content_id_(narrow(content_id)),
           account_id_(std::to_string(account_id)), auth_token_(std::move(auth_token)),
-          game_title_(std::move(game_title)), bind_host_(std::move(bind_host)) 
+          game_title_(std::move(game_title)), client_token_(client_token),
+          bind_host_(std::move(bind_host)) 
 {
     WSADATA data{};
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) 
@@ -495,7 +511,7 @@ void LsxServer::Impl::run()
 
 void LsxServer::Impl::serve(SOCKET client) 
 {
-    DWORD timeout = 250;
+    DWORD timeout = 100;
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
     BOOL nodelay = TRUE;
     setsockopt(client, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
@@ -503,7 +519,114 @@ void LsxServer::Impl::serve(SOCKET client)
     {
         std::lock_guard lock(g_output_mutex);
         std::cout << "LSX client connected\n";
+        debug_lsx("client connected");
     }
+
+    // Older OriginSDK transports are server-first and wait for Challenge.
+    // Rivals first sends the framed ZClient opcode-2 identity record on the
+    // same stream, then changes that stream into an LSX session after the
+    // token acknowledgement.
+    std::array<unsigned char, 256> probe{};
+    const int probed = recv(client, reinterpret_cast<char*>(probe.data()),
+                            static_cast<int>(probe.size()), MSG_PEEK);
+    bool identity_accepted = false;
+    if (probed >= 5 && probe[0] == 2)
+    {
+        const std::uint32_t payload_length =
+            (static_cast<std::uint32_t>(probe[1]) << 24) |
+            (static_cast<std::uint32_t>(probe[2]) << 16) |
+            (static_cast<std::uint32_t>(probe[3]) << 8) |
+            static_cast<std::uint32_t>(probe[4]);
+        const std::size_t frame_length = 5u + payload_length;
+        if (frame_length <= probe.size() &&
+            static_cast<std::size_t>(probed) >= frame_length)
+        {
+            std::vector<char> request(frame_length);
+            if (recv(client, request.data(), static_cast<int>(request.size()), 0) !=
+                static_cast<int>(request.size()))
+            {
+                return;
+            }
+            const std::array<unsigned char, 10> reply = {
+                0x02, 0x00, 0x00, 0x00, 0x05, 0x01,
+                static_cast<unsigned char>(client_token_ >> 24),
+                static_cast<unsigned char>(client_token_ >> 16),
+                static_cast<unsigned char>(client_token_ >> 8),
+                static_cast<unsigned char>(client_token_),
+            };
+            if (send(client, reinterpret_cast<const char*>(reply.data()),
+                     static_cast<int>(reply.size()), 0) !=
+                static_cast<int>(reply.size()))
+            {
+                return;
+            }
+            debug_lsx("accepted opcode-2 identity and returned client token " +
+                      std::to_string(client_token_));
+            identity_accepted = true;
+        }
+    }
+    if (probed > 0 && !identity_accepted)
+    {
+        static constexpr char digits[] = "0123456789abcdef";
+        std::string hex;
+        const std::size_t shown = std::min<std::size_t>(
+            static_cast<std::size_t>(probed), 96);
+        hex.reserve(shown * 3);
+        for (std::size_t i = 0; i < shown; ++i)
+        {
+            if (i) hex.push_back(' ');
+            hex.push_back(digits[probe[i] >> 4]);
+            hex.push_back(digits[probe[i] & 0x0f]);
+        }
+        debug_lsx("rejected client-first EA broker record (" +
+                  std::to_string(probed) + " bytes peeked): " + hex);
+        return;
+    }
+    if (probed == SOCKET_ERROR)
+    {
+        const int error = WSAGetLastError();
+        if (error != WSAETIMEDOUT && error != WSAEWOULDBLOCK &&
+            error != WSAEINTR)
+        {
+            return;
+        }
+    }
+
+    if (identity_accepted)
+    {
+        // This is the CMain/ZClient identity control channel. It remains open
+        // while OriginSDK establishes LSX on the adjacent translated port;
+        // sending an LSX Challenge here makes Rivals close the control socket
+        // and abort initialization.
+        timeout = 250;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        std::array<char, 256> control_buffer{};
+        while (!stopping_.load(std::memory_order_acquire))
+        {
+            const int result = recv(client, control_buffer.data(),
+                                    static_cast<int>(control_buffer.size()), 0);
+            if (result == 0) break;
+            if (result == SOCKET_ERROR)
+            {
+                const int error = WSAGetLastError();
+                if (error == WSAETIMEDOUT || error == WSAEWOULDBLOCK ||
+                    error == WSAEINTR)
+                {
+                    continue;
+                }
+                break;
+            }
+            debug_lsx("identity control channel sent " +
+                      std::to_string(result) + " additional byte(s)");
+        }
+        debug_lsx("identity control channel disconnected");
+        return;
+    }
+
+    timeout = 250;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
 
     const std::string challenge =
         "<LSX><Event sender=\"EALS\"><Challenge key=\"" +
@@ -567,12 +690,14 @@ void LsxServer::Impl::serve(SOCKET client)
             {
                 std::lock_guard lock(g_output_mutex);
                 std::cout << "LSX decrypt failed: " << error.what() << '\n';
+                debug_lsx(std::string("decrypt failed: ") + error.what());
                 return;
             }
 
             {
                 std::lock_guard lock(g_output_mutex);
                 std::cout << "LSX received: " << xml << '\n';
+                debug_lsx(std::string("received: ") + xml);
             }
 
             if (xml.find("<ChallengeResponse") != std::string::npos) 
@@ -593,11 +718,12 @@ void LsxServer::Impl::serve(SOCKET client)
             // the Origin user or the client connection as online.  Send them
             // only after the profile request has completed so OriginSDK has
             // installed the event facilities returned by GetConfig.
-            if (!session.login_events_sent && tag == "GetProfile")
+            if (tag == "GetProfile")
             {
                 const std::string login_event =
                     "<LSX><Event sender=\"EbisuSDK\">"
-                    "<Login IsLoggedIn=\"true\"/>"
+                    "<Login IsLoggedIn=\"true\" UserIndex=\"0\""
+                    " LoginReasonCode=\"ALREADY_ONLINE\"/>"
                     "</Event></LSX>";
                 const std::string online_event =
                     "<LSX><Event sender=\"EbisuSDK\">"
@@ -616,6 +742,7 @@ void LsxServer::Impl::serve(SOCKET client)
 
     std::lock_guard lock(g_output_mutex);
     std::cout << "LSX client disconnected\n";
+    debug_lsx("client disconnected");
 }
 
 bool LsxServer::Impl::handle_challenge(SOCKET client, const std::string& xml,
@@ -757,8 +884,10 @@ std::string LsxServer::Impl::make_response(const std::string& xml,
             body = services_response();
             break;
         case Request::get_profile:
-            body = "<GetProfileResponse PersonaId=\"" + account_id_ +
-                "\" IsSubscriber=\"false\" Persona=\"" + xml_escape(eaid_) +
+            body = "<GetProfileResponse UserIndex=\"0\" PersonaId=\"" + account_id_ +
+                "\" IsSubscriber=\"false\" IsTrialSubscriber=\"false\""
+                " SubscriberLevel=\"0\" IsSteamSubscriber=\"false\" Persona=\"" +
+                xml_escape(eaid_) +
                 "\" CommerceCountry=\"US\" AvatarId=\"C:\\ProgramData\\ZLOEmu\\Avatars\\" +
                 account_id_ + "_40x40.png\" UserId=\"" + account_id_ +
                 "\" GeoCountry=\"US\" CommerceCurrency=\"ZLO\" Country=\"RU\""
@@ -769,7 +898,7 @@ std::string LsxServer::Impl::make_response(const std::string& xml,
             const std::string value =
                 (setting == "ENVIRONMENT" || setting == "Environment")
                     ? "production"
-                    : setting == "IS_IGO_ENABLED" ? "true" : "false";
+                    : "false";
             body = "<GetSettingResponse Setting=\"" + value + "\"/>";
             break;
         }
@@ -816,15 +945,16 @@ std::string LsxServer::Impl::make_response(const std::string& xml,
             break;
         case Request::get_auth_token:
         {
-            // CMain's legacy NFS13 path expects the same sentinel returned by
-            // ZClient. The launch-time ZLOCAL1 token works for initial Blaze
-            // authentication, but OriginGetAuthToken rejects it when the
-            // pause-menu Autolog reconnect explicitly requests a fresh token.
-            const bool nfs13 = session.content_id == "71530" ||
-                session.game_title.find("Most Wanted") != std::string::npos;
-            const std::string_view token = nfs13
-                ? kZloAuthToken : std::string_view(auth_token_);
-            body = "<AuthToken value=\"" + xml_escape(token) + "\"/>";
+            // The recovered ZLO LSX implementation returns this fixed
+            // OriginSDK token. Rivals needs that legacy prefix to pass its
+            // local sign-in gate, while the Blaze backend also needs the
+            // instance identity. Append the launcher's private identity token
+            // and configured account ID without changing the legacy prefix.
+            std::string origin_token(kZloAuthToken);
+            if (auth_token_.rfind(kLocalAuthTokenPrefix, 0) == 0) {
+                origin_token += ":" + auth_token_ + ":" + account_id_;
+            }
+            body = "<AuthToken value=\"" + xml_escape(origin_token) + "\"/>";
             break;
         }
         case Request::get_auth_code:
@@ -894,6 +1024,7 @@ std::string LsxServer::Impl::make_response(const std::string& xml,
     {
         std::lock_guard lock(g_output_mutex);
         std::cout << "LSX replying to " << tag << '\n';
+        debug_lsx(std::string("replying to ") + tag);
     }
 
     return "<LSX><Response sender=\"" + xml_escape(sender) + "\" id=\"" +
@@ -908,6 +1039,7 @@ bool LsxServer::Impl::send_packet(SOCKET client, const std::string& xml, const A
     {
         std::lock_guard lock(g_output_mutex);
         std::cout << "LSX sent: " << xml << '\n';
+        debug_lsx(std::string("sent: ") + xml);
     }
 
     return send_all(client, packet);

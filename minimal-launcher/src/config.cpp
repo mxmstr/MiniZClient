@@ -180,6 +180,7 @@ void apply_config_value(Options& options, std::string key, const std::string& ra
     else if (key == "bootstrap-x86")            options.bootstrap_x86 = path_value();
     else if (key == "injector-x86")             options.injector_x86 = path_value();
     else if (key == "lsx-shim")                 options.lsx_shim = path_value();
+    else if (key == "lsx-shim-x86")             options.lsx_shim_x86 = path_value();
     else if (key == "trace-game-dll")           options.trace_game_dll = path_value();
     else if (key == "license-response")          options.license_response = path_value();
     else if (key == "license-signature")         options.license_signature = narrow_value();
@@ -213,6 +214,8 @@ void apply_config_value(Options& options, std::string key, const std::string& ra
     else if (key == "game-module-id")           options.game_module_id = parse_u32(value, "game-module-id");
     else if (key == "activation-executable")    options.activation_executable = narrow_value();
     else if (key == "activation-module-id")     options.activation_module_id = parse_u32(value, "activation-module-id");
+    else if (key == "compatibility-profile")    options.compatibility_profile = narrow_value();
+    else if (key == "activation-module-sha256") options.activation_module_sha256 = narrow_value();
     else if (key == "client-token")             options.client_token = parse_u32(value, "client-token");
     else if (key == "zbackend")                 options.zbackend_endpoint = value;
     else if (key == "zbackend-digest")          options.zbackend_digest = narrow_value();
@@ -225,6 +228,7 @@ void apply_config_value(Options& options, std::string key, const std::string& ra
         else fail(L"lsx-log must be true or false.");
     }
     else if (key == "breakaway") options.breakaway = (value == L"true" || value == L"1");
+    else if (key == "no-zlo-runtime") options.no_zlo_runtime = (value == L"true" || value == L"1");
     else fail("Unknown config key: " + key);
 }
 
@@ -268,14 +272,15 @@ Options parse_options(int argc, wchar_t** argv)
 
     enum class Argument {
         unknown,
-        config, game, bootstrap, bootstrap_x86, injector_x86, lsx_shim, trace_game_dll,
+        config, game, bootstrap, bootstrap_x86, injector_x86, lsx_shim, lsx_shim_x86, trace_game_dll,
         license_response, license_signature,
         data_path, frosty_pack, game_arg, bf3_mode, bf3_server_id,
         bf3_launch_url, eaid, content_id, game_title,
         game_id, game_executable, module_id, game_module_id,
-        activation_executable, activation_module_id, account_id, client_token,
+        activation_executable, activation_module_id, compatibility_profile,
+        activation_module_sha256, account_id, client_token,
         zbackend, zbackend_digest, service_host, lsx_host, lsx_log, no_lsx_log,
-        breakaway, manual_map, separator, help
+        breakaway, no_zlo_runtime, manual_map, separator, help
     };
 
     const auto classify_argument = [](std::wstring_view value) {
@@ -290,6 +295,7 @@ Options parse_options(int argc, wchar_t** argv)
             {L"--bootstrap-x86", Argument::bootstrap_x86},
             {L"--injector-x86", Argument::injector_x86},
             {L"--lsx-shim", Argument::lsx_shim},
+            {L"--lsx-shim-x86", Argument::lsx_shim_x86},
             {L"--trace-game-dll", Argument::trace_game_dll},
             {L"--license-response", Argument::license_response},
             {L"--license-signature", Argument::license_signature},
@@ -309,6 +315,8 @@ Options parse_options(int argc, wchar_t** argv)
             {L"--game-module-id", Argument::game_module_id},
             {L"--activation-executable", Argument::activation_executable},
             {L"--activation-module-id", Argument::activation_module_id},
+            {L"--compatibility-profile", Argument::compatibility_profile},
+            {L"--activation-module-sha256", Argument::activation_module_sha256},
             {L"--account-id", Argument::account_id},
             {L"--client-token", Argument::client_token},
             {L"--zbackend", Argument::zbackend},
@@ -318,6 +326,7 @@ Options parse_options(int argc, wchar_t** argv)
             {L"--lsx-log", Argument::lsx_log},
             {L"--no-lsx-log", Argument::no_lsx_log},
             {L"--breakaway", Argument::breakaway},
+            {L"--no-zlo-runtime", Argument::no_zlo_runtime},
             {L"--manual-map", Argument::manual_map},
             {L"--", Argument::separator},
             {L"--help", Argument::help},
@@ -386,6 +395,10 @@ Options parse_options(int argc, wchar_t** argv)
             case Argument::lsx_shim:
                 if (i + 1 >= argc) break;
                 options.lsx_shim = fs::absolute(argv[++i]);
+                continue;
+            case Argument::lsx_shim_x86:
+                if (i + 1 >= argc) break;
+                options.lsx_shim_x86 = fs::absolute(argv[++i]);
                 continue;
             case Argument::trace_game_dll:
                 if (i + 1 >= argc) break;
@@ -466,6 +479,14 @@ Options parse_options(int argc, wchar_t** argv)
                 if (i + 1 >= argc) break;
                 options.activation_module_id = parse_u32(argv[++i], "--activation-module-id");
                 continue;
+            case Argument::compatibility_profile:
+                if (i + 1 >= argc) break;
+                options.compatibility_profile = encode_utf8(argv[++i]);
+                continue;
+            case Argument::activation_module_sha256:
+                if (i + 1 >= argc) break;
+                options.activation_module_sha256 = encode_utf8(argv[++i]);
+                continue;
             case Argument::account_id: {
                 if (i + 1 >= argc) break;
                 const std::wstring value(argv[++i]);
@@ -514,6 +535,9 @@ Options parse_options(int argc, wchar_t** argv)
             case Argument::breakaway:
                 options.breakaway = true;
                 continue;
+            case Argument::no_zlo_runtime:
+                options.no_zlo_runtime = true;
+                continue;
             case Argument::manual_map:
                 // Retained for compatibility with earlier launch commands. Direct
                 // mapping is now the only bootstrap path.
@@ -529,6 +553,7 @@ Options parse_options(int argc, wchar_t** argv)
                             L"[--bootstrap-x86 CLoaderx32.dll] "
                             L"[--injector-x86 zclient_injector32.exe] "
                             L"[--lsx-shim ZClient.LsxShim64.dll] "
+                            L"[--lsx-shim-x86 ZClient.LsxShim32.dll] "
                             L"[--trace-game-dll ZClient.GameTrace64.dll] "
                             L"[--license-response response.bin --license-signature base64] "
                             L"[--frosty-pack name | --data-path directory] "
@@ -539,11 +564,12 @@ Options parse_options(int argc, wchar_t** argv)
                             L"[--game-title title] [--game-id id] [--game-executable name] "
                             L"[--module-id id] [--game-module-id id] "
                             L"[--activation-executable name --activation-module-id id] "
+                            L"[--compatibility-profile rivals --activation-module-sha256 64hex] "
                             L"[--client-token id] "
                             L"[--zbackend [host:port] --zbackend-digest 32hex] "
                             L"[--service-host Blaze-IPv4] [--lsx-host local-IPv4] "
                             L"[--lsx-log | --no-lsx-log] "
-                            L"[--breakaway]\n";
+                            L"[--breakaway] [--no-zlo-runtime]\n";
                 ExitProcess(0);
             case Argument::unknown:
                 break;
@@ -562,10 +588,12 @@ Options parse_options(int argc, wchar_t** argv)
     if (options.content_id.empty()) missing.emplace_back("content-id");
     if (options.game_title.empty()) missing.emplace_back("game-title");
     if (!options.game_id) missing.emplace_back("game-id");
-    if (options.game_executable.empty()) missing.emplace_back("game-executable");
-    if (!options.module_id) missing.emplace_back("module-id");
-    if (!options.game_module_id) missing.emplace_back("game-module-id");
-    if (!options.client_token) missing.emplace_back("client-token");
+    if (!options.no_zlo_runtime) {
+        if (options.game_executable.empty()) missing.emplace_back("game-executable");
+        if (!options.module_id) missing.emplace_back("module-id");
+        if (!options.game_module_id) missing.emplace_back("game-module-id");
+        if (!options.client_token) missing.emplace_back("client-token");
+    }
     if (options.activation_executable.empty() != (options.activation_module_id == 0)) 
     {
         fail(L"activation-executable and activation-module-id must be supplied together.");
@@ -574,6 +602,11 @@ Options parse_options(int argc, wchar_t** argv)
     {
         fail(L"license-response and license-signature must be supplied together.");
     }
+    if (!options.compatibility_profile.empty() && !options.no_zlo_runtime)
+        fail("compatibility-profile is available only with no-zlo-runtime.");
+    if (options.compatibility_profile.empty() &&
+        !options.activation_module_sha256.empty())
+        fail("activation-module-sha256 requires compatibility-profile.");
     validate_bf3_launch(options.bf3_launch);
 
     if (!missing.empty()) 
@@ -638,6 +671,10 @@ Options parse_options(int argc, wchar_t** argv)
     if (options.lsx_shim.empty()) 
     {
         options.lsx_shim = executable_asset(L"ZClient.LsxShim64.dll");
+    }
+    if (options.lsx_shim_x86.empty())
+    {
+        options.lsx_shim_x86 = executable_asset(L"ZClient.LsxShim32.dll");
     }
     if (options.eaid.empty()) 
     {

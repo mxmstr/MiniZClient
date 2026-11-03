@@ -16,7 +16,8 @@ public:
     
     LsxServer(std::string bind_host, std::uint16_t port, std::wstring eaid,
               std::wstring content_id, std::string auth_token, std::string game_title,
-              std::uint64_t account_id = 1000000000001ull);
+              std::uint64_t account_id = 1000000000001ull,
+              std::uint32_t client_token = 0xa0000009u);
     ~LsxServer();
 
     LsxServer(const LsxServer&) = delete;
@@ -49,6 +50,9 @@ public:
 
     Impl(std::string bind_host, std::uint16_t port, std::wstring eaid, std::wstring content_id,
          std::string auth_token, std::string game_title, std::uint64_t account_id);
+    Impl(std::string bind_host, std::uint16_t port, std::wstring eaid,
+         std::wstring content_id, std::string auth_token, std::string game_title,
+         std::uint64_t account_id, std::uint32_t client_token);
 
     ~Impl();
 
@@ -60,6 +64,7 @@ private:
     std::string account_id_;
     std::string auth_token_;
     std::string game_title_;
+    std::uint32_t client_token_ = 0xa0000009u;
     bool winsock_started_ = false;
     std::string bind_host_;
     SOCKET listener_ = INVALID_SOCKET;

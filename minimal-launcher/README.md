@@ -12,9 +12,12 @@ cmake --build build
 ```
 
 The x64 build automatically creates a small native Win32 helper with the Visual
-Studio 2022 Win32 toolchain and copies it beside the launcher. The launcher
+Studio 2022 Win32 toolchain, builds the shared LSX shim for both architectures,
+and copies them beside the launcher. The launcher
 looks for `CLoaderx64.dll`, `CLoaderx32.dll`, `zclient_injector32.exe`, and
 `ZClient.LsxShim64.dll` beside its executable unless their paths are configured.
+`ZClient.LsxShim32.dll` is also published beside the launcher for the emerging
+CLoader/CMain-free Win32 path.
 
 Native x64 games are mapped directly by the launcher and use the process-local
 LSX shim. Native Win32 games are mapped by `zclient_injector32.exe`; the x64
@@ -22,6 +25,21 @@ parent remains responsible for the pipe, process job, identity, and LSX service.
 This same-architecture split is required because a 64-bit process cannot reuse
 its DLL addresses or native thread context to initialize imports in a WOW64
 target safely.
+
+The LSX shim supports an internal standalone mode selected with the inherited
+`ZCLIENT_LSX_STANDALONE=1` environment variable. In this mode it enables its
+network hooks as soon as its local LSX listener and early identity hooks are
+ready, without waiting for CLoader/CMain to signal it. The launcher does not
+select it on the legacy bootstrap path. With `--no-zlo-runtime`, the launcher
+injects only the architecture-matched LSX shim, waits for its listener and
+network hooks, applies a Blaze redirect when the title contains a known
+hostname, and releases the suspended entry point. It does not map CLoader,
+host the ZClient pipe, or create the CMain marker.
+
+The first local instance prefers OriginSDK's discovery port 3216. If that port
+is already occupied, later instances bind an ephemeral loopback port and their
+process-local hooks redirect OriginSDK's 3216/6176/8216 connections to the
+correct per-instance LSX listener.
 
 ## Game configuration
 
@@ -48,6 +66,39 @@ Edit `game` in `rivals.conf` for the local installation. Config uses one
 are ignored. Relative file paths are resolved relative to the config file.
 Command-line options override config values regardless of where `--config`
 appears. `game-arg` may be repeated in a config file.
+
+For the CLoader/CMain-free path, add `no-zlo-runtime=true` to the config or pass
+`--no-zlo-runtime`. The legacy-only `game-executable`, `module-id`,
+`game-module-id`, and `client-token` values are then optional. Native x64 uses
+`ZClient.LsxShim64.dll`; Win32 uses `ZClient.LsxShim32.dll` through
+`zclient_injector32.exe`. Override the latter with `lsx-shim-x86=...` or
+`--lsx-shim-x86 ...` when needed.
+
+```powershell
+.\build\Release\zclient_minimal_launcher.exe `
+  --config ..\rivals.conf --no-zlo-runtime --eaid player-one
+```
+
+The shim-only launcher also debugs the created process tree. Each descendant is
+reported before its entry point runs and receives the matching x86 or x64 shim
+before execution continues. This replaces CLoader's child injector without
+patching `CreateProcess` inside the game.
+
+Legacy Rivals activation can be enabled with a fail-closed title profile:
+
+```ini
+no-zlo-runtime=true
+compatibility-profile=rivals
+activation-module-sha256=<SHA-256 of the local Activation.dll>
+```
+
+Obtain the value with `Get-FileHash .\Activation.dll -Algorithm SHA256`.
+
+The profile recognizes only `Activation.dll`, verifies the complete file hash
+from the loader event, validates the original key prefix at RVA `0xC75E0`, and
+then installs the recovered 128-byte DSA key. Unknown hashes and signatures
+abort the launch. The replacement key is built into the launcher; neither
+`CMainx32.dll` nor a scan of CMain memory is required.
 
 When `--config` is omitted, the launcher automatically loads
 `MiniZClient.conf` from the directory containing the launcher executable if
@@ -91,10 +142,20 @@ or pass `--no-lsx-log` to prevent creation of `ZClient.LsxShim-<pid>.log`.
 Use `lsx-log=true` or `--lsx-log` to enable it explicitly; command-line toggles
 override the config setting.
 
-For Need for Speed Most Wanted 2012, the LSX `GetAuthToken` response uses
-CMain's legacy `WAHAHA_IMMA_ZLO_TOKEN` sentinel. The title accepts the local
-`ZLOCAL1` identity during its injected startup login but requires the legacy
-sentinel when Autolog is manually reconnected from the pause menu.
+The LSX `GetAuthToken` response retains the recovered ZLO
+`WAHAHA_IMMA_ZLO_TOKEN` prefix required by older OriginSDK titles. Local
+launches append the private `ZLOCAL1` EAID token and configured numeric account
+ID so simultaneous instances authenticate to Blaze as distinct users. The
+backend continues to accept the exact fixed sentinel for older launchers.
+
+The standalone Rivals profile reproduces both certificate paths used by the
+original runtime. CryptoAPI trust errors are cleared only for a chain that
+contains both a ZLO issuer (`ZCertMaker` or `admin@zlofenix.org`) and a
+`gosredirector` identity. Rivals' embedded DirtySSL path verifies its parsed
+certificate through `BCryptVerifySignature`; for this title CMain replaced
+that call with `STATUS_SUCCESS`, so the shim applies the same replacement only
+inside a standalone Rivals process. No certificate is installed into a
+Windows trust store.
 
 If `eaid` is omitted, the launcher searches nearby directories for
 `ZData_Settings.zlo`. A standalone EA ID maps deterministically to the numeric

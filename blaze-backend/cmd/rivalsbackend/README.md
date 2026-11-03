@@ -9,17 +9,28 @@ acknowledgement cursors, leave handling, and peer expiry.
 It also exposes the TLS/Blaze endpoint expected by NFS14 on the selected LAN
 IPv4 address at port 4531. That endpoint replays the captured successful ZClient
 initialization exchange, while rewriting each response correlation ID to match
-the live client request. A fresh certificate containing the advertised LAN IPv4
-address is created when the server starts.
+the live client request. The Rivals profile uses the recovered compact ZLO
+`winter15.gosredirector.ea.com` certificate because the title's DirtySSL parser
+does not advance past a larger generated certificate flight. The launcher shim
+trusts that identity only inside the game process.
 
 The companion TLS/Blaze redirector listens on that LAN address at port 47127. It advertises
 the automatically detected LAN IPv4 address and secure Blaze port 4531. Override
 that address with `-advertise-host <IPv4>` when routing requires it.
+Rivals' DirtySSL client rejects the ServerHello flight emitted by Go's modern
+TLS implementation before it reaches the Windows certificate APIs. The
+redirector therefore uses the bundled patched OpenSSL 1.0.2 runtime strictly
+as a TLS 1.1/AES256-SHA transport. Blaze parsing and response construction stay
+inside the Go backend. For a packaged backend, copy
+`build\openssl-ssl3\openssl-ds3-pipe.exe` to
+`openssl-ssl3\openssl-ds3-pipe.exe` beside the backend executable.
 
-Build and run it from the `ZClient` directory:
+Build it from the `ZClient/backend` directory, then run from `ZClient` so the
+bundled SSL3 runtime remains available under `build/openssl-ssl3`:
 
 ```powershell
-go build -o build/rivals-backend.exe ./cmd/rivalsbackend
+go build -o ../build/rivals-backend.exe ./cmd/rivalsbackend
+cd ..
 ./build/rivals-backend.exe -token "replace-with-a-16-character-token"
 ```
 
@@ -113,9 +124,10 @@ generated from a real ZClient format-4 recorder session with
 `cmd/ds3replaygen`; the next implementation milestone is replacing the replayed
 GameManager flow with stateful matchmaking handlers.
 
-The minimal launcher identifies each client through a `ZLOCAL1` authentication
-token derived from its `--eaid`. The Blaze service personalizes login/session
-frames, assigns stable per-name IDs, sends public matchmaking setup through the
-same shared registry used by the ASI coordinator, and pushes player-added and
-game-state notifications directly to connected Blaze clients. Each simultaneous
-client must therefore use a different `--eaid`.
+The minimal launcher identifies each client through a legacy-prefixed local
+authentication token containing its configured `--eaid` and `--account-id`.
+The Blaze service personalizes login/session frames with both values, sends
+public matchmaking setup through the same shared registry used by the ASI
+coordinator, and pushes player-added and game-state notifications directly to
+connected Blaze clients. Each simultaneous client must therefore use a unique
+EAID and account ID.

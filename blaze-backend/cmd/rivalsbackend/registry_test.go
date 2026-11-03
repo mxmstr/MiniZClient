@@ -15,7 +15,7 @@ import (
 
 func capturedSetup(t *testing.T, name string) (Packet, []byte) {
 	t.Helper()
-	path := filepath.Join("..", "..", "research", "rivals", "traces", name)
+	path := filepath.Join("..", "..", "..", "research", "rivals", "traces", name)
 	file, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)

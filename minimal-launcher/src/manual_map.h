@@ -35,6 +35,12 @@ ManualMapResult manual_map_zclient_loader(
     const std::string& lsx_host, const std::string& instance_name,
     const std::filesystem::path& preload_dll = {});
 
+void preload_standalone_lsx_shim(
+    HANDLE process, HANDLE primary_thread, DWORD process_id,
+    const std::filesystem::path& shim_path,
+    const std::string& service_host,
+    bool preserve_suspended = false);
+
 // Prepare the raw PE payload placed in Global\\ZClient_CLoaderx64 for CLoader's
 // child-process injector. Routing changes must be applied to the file
 // representation before it is published.
